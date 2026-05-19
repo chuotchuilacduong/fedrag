@@ -30,14 +30,19 @@ class GraphLLM(torch.nn.Module):
         self.max_new_tokens = args.max_new_tokens
 
         print('Loading LLAMA')
+        import torch
+        n_gpus = torch.cuda.device_count()
+        max_memory = {i: '80GiB' for i in range(n_gpus)} if n_gpus > 0 else None
         kwargs = {
-            "max_memory": {0: '80GiB', 1: '80GiB'},
             "device_map": "auto",
             "revision": "main",
         }
+        if max_memory:
+            kwargs["max_memory"] = max_memory
 
         self.tokenizer = AutoTokenizer.from_pretrained(args.llm_model_path, use_fast=False, revision=kwargs["revision"])
-        self.tokenizer.pad_token_id = 0
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.tokenizer.padding_side = 'left'
 
         model = AutoModelForCausalLM.from_pretrained(
@@ -74,6 +79,8 @@ class GraphLLM(torch.nn.Module):
         self.model = model
         print('Finish loading LLAMA!')
 
+        llm_hidden_size = self.model.config.hidden_size
+
         self.graph_encoder = load_gnn_model[args.gnn_model_name](
             in_channels=args.gnn_in_dim,
             out_channels=args.gnn_hidden_dim,
@@ -86,7 +93,7 @@ class GraphLLM(torch.nn.Module):
         self.projector = nn.Sequential(
             nn.Linear(args.gnn_hidden_dim, 2048),
             nn.Sigmoid(),
-            nn.Linear(2048, 4096),
+            nn.Linear(2048, llm_hidden_size),
         ).to(self.model.device)
 
         self.word_embedding = self.model.model.get_input_embeddings()
@@ -211,6 +218,7 @@ class GraphLLM(torch.nn.Module):
                 inputs_embeds=inputs_embeds,
                 max_new_tokens=self.max_new_tokens,
                 attention_mask=attention_mask,
+                pad_token_id=self.tokenizer.pad_token_id,
                 # do_sample=True,
                 use_cache=True  # IMPORTANT!
             )

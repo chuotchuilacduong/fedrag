@@ -8,6 +8,7 @@ from typing import Mapping, Sequence
 
 import torch
 from torch import Tensor, nn
+from tqdm import tqdm
 
 from .chunk_selection import ChunkSelection, select_chunks, topk_softmax
 
@@ -129,7 +130,7 @@ def hierarchical_text_condensation(
     contexts: dict[int, Tensor] = {}
     traces: dict[int, NodeEvidenceTrace] = {}
 
-    for core_id in [int(node_id) for node_id in core_node_ids]:
+    for core_id in tqdm([int(node_id) for node_id in core_node_ids], desc="Stage B condense", unit="node"):
         g_v = graph_embeddings[core_id]
         selected_by_hop: dict[int, HopSelection] = {}
         selected_nodes_for_chunks: list[int] = []

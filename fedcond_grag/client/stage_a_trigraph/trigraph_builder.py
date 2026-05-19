@@ -55,7 +55,7 @@ def build_trigraph_for_client(
     working_dir: str | Path,
     dataset_name: str,
     encoder: NodeEncoder | None = None,
-    spacy_model: str = "en_core_web_trf",
+    spacy_model: str = "en_core_web_sm",
 ) -> Data:
     """Build a Tri-Graph PyG Data object for one client's corpus.
 
@@ -90,7 +90,7 @@ class TriGraphBuilder:
     working_dir: str | Path
     dataset_name: str
     encoder: NodeEncoder | None = None
-    spacy_model: str = "en_core_web_trf"
+    spacy_model: str = "en_core_web_sm"
 
     def build(self, passages: Sequence[str]) -> Data:
         from fedcond_grag.linearrag import LinearRAG, LinearRAGConfig

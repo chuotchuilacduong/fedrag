@@ -11,4 +11,6 @@ llama_model_path = {
     "7b_chat": "meta-llama/Llama-2-7b-chat-hf",
     "13b": "meta-llama/Llama-2-13b-hf",
     "13b_chat": "meta-llama/Llama-2-13b-chat-hf",
+    "qwen2-1.5b": "Qwen/Qwen2-1.5B",
+    "qwen2.5-1.5b": "Qwen/Qwen2.5-1.5B",
 }

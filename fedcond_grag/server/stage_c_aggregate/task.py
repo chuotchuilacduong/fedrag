@@ -19,7 +19,9 @@ class CondensationQATask:
         self.client_id = client_id
         self.data_dir = data_dir
         self.device = device
-        self.data = data.to(device) if data is not None else None
+        # Keep the trigraph on CPU — it's multi-GB and only moved to device
+        # lazily inside _condense_anchor_graph() via graph.to(self.device).
+        self.data = data
         self.override_evaluate = None
         self.step_preprocess = None
 

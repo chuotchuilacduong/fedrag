@@ -1,49 +1,110 @@
-import spacy
+"""SpaCy NER with multiprocessing support for large-scale passage indexing."""
+
+from __future__ import annotations
+
+import os
 from collections import defaultdict
-import pdb
+from multiprocessing import Pool
 
 
-class SpacyNER:
-    def __init__(self,spacy_model):
-        self.spacy_model = spacy.load(spacy_model)
+# ---------------------------------------------------------------------------
+# Worker (runs in child process — no shared state with parent)
+# ---------------------------------------------------------------------------
 
-    def batch_ner(self, hash_id_to_passage, max_workers):
-        passage_list = list(hash_id_to_passage.values())
-        batch_size = max(1, len(passage_list) // max_workers)
-        docs_list = self.spacy_model.pipe(passage_list,batch_size=batch_size)
-        passage_hash_id_to_entities = {}
-        sentence_to_entities = defaultdict(list)
-        for idx,doc in enumerate(docs_list):
-            passage_hash_id = list(hash_id_to_passage.keys())[idx]
-            single_passage_hash_id_to_entities,single_sentence_to_entities = self.extract_entities_sentences(doc,passage_hash_id)
-            passage_hash_id_to_entities.update(single_passage_hash_id_to_entities)
-            for sent, ents in single_sentence_to_entities.items():
-                for e in ents:
-                    if e not in sentence_to_entities[sent]:
-                        sentence_to_entities[sent].append(e)
-        return passage_hash_id_to_entities,sentence_to_entities
-            
-    def extract_entities_sentences(self, doc,passage_hash_id):
-        sentence_to_entities = defaultdict(list)
-        unique_entities = set()
-        passage_hash_id_to_entities = {}
-        # pdb.set_trace()  # 注释掉调试断点
+def _ner_worker(args: tuple) -> tuple[dict, dict]:
+    """Process a chunk of passages in an isolated subprocess."""
+    model_name, hids, texts = args
+    import spacy
+
+    # Keep only ner + sentencizer (disable heavy parser/tagger)
+    disabled = ["tok2vec", "tagger", "parser", "senter",
+                "attribute_ruler", "lemmatizer"]
+    nlp = spacy.load(model_name, disable=disabled, exclude=disabled)
+    if "sentencizer" not in nlp.pipe_names:
+        nlp.add_pipe("sentencizer", first=True)
+
+    p_to_ents: dict[str, list[str]] = {}
+    s_to_ents: dict[str, list[str]] = defaultdict(list)
+
+    for hid, doc in zip(hids, nlp.pipe(texts, batch_size=64)):
+        unique: set[str] = set()
         for ent in doc.ents:
-            if ent.label_ == "ORDINAL" or ent.label_ == "CARDINAL":
+            if ent.label_ in ("ORDINAL", "CARDINAL"):
                 continue
             sent_text = ent.sent.text
             ent_text = ent.text
-            if ent_text not in sentence_to_entities[sent_text]:
-                sentence_to_entities[sent_text].append(ent_text)
-            unique_entities.add(ent_text)
-        passage_hash_id_to_entities[passage_hash_id] = list(unique_entities)
-        return passage_hash_id_to_entities,sentence_to_entities
+            if ent_text not in s_to_ents[sent_text]:
+                s_to_ents[sent_text].append(ent_text)
+            unique.add(ent_text)
+        p_to_ents[hid] = list(unique)
 
-    def question_ner(self, question: str):
-        doc = self.spacy_model(question)
-        question_entities = set()
-        for ent in doc.ents:
-            if ent.label_ == "ORDINAL" or ent.label_ == "CARDINAL":
-                continue
-            question_entities.add(ent.text.lower())
-        return question_entities
+    return p_to_ents, dict(s_to_ents)
+
+
+# ---------------------------------------------------------------------------
+# Public class
+# ---------------------------------------------------------------------------
+
+class SpacyNER:
+    def __init__(self, spacy_model: str = "en_core_web_sm"):
+        self.spacy_model = spacy_model
+        # Validate model exists (fail fast)
+        import spacy as _spacy
+        _spacy.load(spacy_model, disable=["parser"])
+
+    def batch_ner(
+        self,
+        hash_id_to_passage: dict[str, str],
+        max_workers: int | None = None,
+    ) -> tuple[dict, dict]:
+        """Run NER on all passages using a multiprocessing pool."""
+        if max_workers is None:
+            max_workers = min(os.cpu_count() or 4, 16)
+
+        hids = list(hash_id_to_passage.keys())
+        texts = [hash_id_to_passage[h] for h in hids]
+        n = len(hids)
+
+        if n == 0:
+            return {}, {}
+
+        # Split into per-worker chunks
+        n_workers = min(max_workers, n)
+        chunk_size = max(1, (n + n_workers - 1) // n_workers)
+        chunks = [
+            (self.spacy_model, hids[i:i+chunk_size], texts[i:i+chunk_size])
+            for i in range(0, n, chunk_size)
+        ]
+
+        passage_to_ents: dict[str, list[str]] = {}
+        sentence_to_ents: dict[str, list[str]] = defaultdict(list)
+
+        if n_workers == 1:
+            # Single-process path (avoids fork overhead for tiny inputs)
+            p, s = _ner_worker(chunks[0])
+            passage_to_ents.update(p)
+            for sent, ents in s.items():
+                for e in ents:
+                    if e not in sentence_to_ents[sent]:
+                        sentence_to_ents[sent].append(e)
+        else:
+            with Pool(processes=n_workers) as pool:
+                results = pool.map(_ner_worker, chunks)
+            for p, s in results:
+                passage_to_ents.update(p)
+                for sent, ents in s.items():
+                    for e in ents:
+                        if e not in sentence_to_ents[sent]:
+                            sentence_to_ents[sent].append(e)
+
+        return passage_to_ents, dict(sentence_to_ents)
+
+    def question_ner(self, question: str) -> set[str]:
+        import spacy
+        nlp = spacy.load(self.spacy_model, disable=["parser"])
+        doc = nlp(question)
+        return {
+            ent.text.lower()
+            for ent in doc.ents
+            if ent.label_ not in ("ORDINAL", "CARDINAL")
+        }

@@ -168,6 +168,7 @@ class DualGraphLLM(GraphLLM):
                 inputs_embeds=inputs_embeds,
                 max_new_tokens=self.max_new_tokens,
                 attention_mask=attention_mask,
+                pad_token_id=self.tokenizer.pad_token_id,
                 use_cache=True,
             )
         pred = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)

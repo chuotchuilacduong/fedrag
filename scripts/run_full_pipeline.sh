@@ -23,7 +23,7 @@ CONDA_ENV="${CONDA_ENV:-fedcond}"
 
 # LLM
 LLM_MODEL_NAME="${LLM_MODEL_NAME:-7b}"
-LLM_MODEL_PATH="${LLM_MODEL_PATH:-meta-llama/Llama-2-7b-hf}"
+LLM_MODEL_PATH="${LLM_MODEL_PATH:-}"  # empty = auto-resolve from model name registry
 
 # GNN
 GNN_MODEL_NAME="${GNN_MODEL_NAME:-gt}"
@@ -38,6 +38,9 @@ NUM_GLOBAL_SYN_NODES="${NUM_GLOBAL_SYN_NODES:-512}"
 SERVER_CONDENSE_ITERS="${SERVER_CONDENSE_ITERS:-50}"
 HID_DIM="${HID_DIM:-384}"
 NUM_LAYERS="${NUM_LAYERS:-4}"
+
+# Stage B (client condensation)
+ENTITY_RATIO="${ENTITY_RATIO:-0.05}"
 
 # Stage D (local training)
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-1}"
@@ -64,6 +67,7 @@ while [[ $# -gt 0 ]]; do
         --local-epochs)   LOCAL_EPOCHS="$2";         shift 2 ;;
         --local-lr)       LOCAL_LR="$2";             shift 2 ;;
         --syn-nodes)      NUM_GLOBAL_SYN_NODES="$2"; shift 2 ;;
+        --entity-ratio)   ENTITY_RATIO="$2";         shift 2 ;;
         --no-cuda)        USE_CUDA=0;                shift 1 ;;
         *) echo "[warn] unknown flag: $1"; shift ;;
     esac
@@ -82,6 +86,7 @@ fi
 if [[ -z "$PYTHON" || ! -x "$PYTHON" ]]; then
     PYTHON="python"
 fi
+export PYTHONUNBUFFERED=1  # unbuffered stdout so tee sees prints immediately
 
 CUDA_FLAG=""
 [[ "$USE_CUDA" == "1" ]] && CUDA_FLAG="--use-cuda"
@@ -103,7 +108,8 @@ log "Checking environment"
 log "Step 1 — Preprocess (Stage A → B) for $NUM_CLIENTS client(s)"
 "$PYTHON" main.py preprocess \
     --dataset "$DATASET" \
-    --num-clients "$NUM_CLIENTS"
+    --num-clients "$NUM_CLIENTS" \
+    --entity-ratio "$ENTITY_RATIO"
 
 # ---------------------------------------------------------------------------
 # Step 2 — Federated loop: Stage C bootstrap (round 0) + Stage C+D (round 1+)

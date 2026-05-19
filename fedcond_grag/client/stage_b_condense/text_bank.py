@@ -95,6 +95,7 @@ def encode_texts(encoder: nn.Module, texts: Sequence[str], device: torch.device 
     return embeddings
 
 
+@torch.no_grad()
 def build_text_bank(
     node_texts: Sequence[str],
     *,
@@ -103,35 +104,56 @@ def build_text_bank(
     dim: int = 384,
     max_chunk_tokens: int = 64,
     device: torch.device | None = None,
+    batch_size: int = 4096,
 ) -> TextBank:
-    """Build a frozen local text bank for all nodes."""
+    """Build a frozen local text bank for all nodes — fully batched for speed."""
 
     encoder = encoder or load_frozen_encoder(encoder_name=encoder_name, dim=dim)
     for parameter in encoder.parameters():
         parameter.requires_grad_(False)
     encoder.eval()
 
-    chunk_embeddings: list[Tensor] = []
-    node_rows: list[Tensor] = []
+    n = len(node_texts)
+    if n == 0:
+        return TextBank(
+            node_embeddings=torch.empty((0, dim), dtype=torch.float32),
+            chunk_embeddings=[],
+            encoder_name=encoder_name,
+            dim=dim,
+        )
+
+    # 1. Chunk every node text, track which chunks belong to which node
+    all_chunks: list[str] = []
+    node_chunk_counts: list[int] = []
     for text in node_texts:
         chunks = chunk_text(str(text), max_tokens=max_chunk_tokens)
-        encoded = encode_texts(encoder, chunks, device=device)
-        if encoded.numel() == 0:
-            encoded = torch.zeros((1, dim), dtype=torch.float32, device=device)
-        chunk_embeddings.append(encoded)
-        node_rows.append(encoded.mean(dim=0))
+        all_chunks.extend(chunks)
+        node_chunk_counts.append(len(chunks))
 
-    if node_rows:
-        node_embeddings = torch.stack(node_rows, dim=0)
-        bank_dim = int(node_embeddings.size(1))
-    else:
-        bank_dim = int(dim)
-        node_embeddings = torch.empty((0, bank_dim), dtype=torch.float32, device=device)
+    # 2. Encode ALL chunks in large batches (single pass, GPU-efficient)
+    all_embeddings_list: list[Tensor] = []
+    for start in range(0, len(all_chunks), batch_size):
+        batch = all_chunks[start : start + batch_size]
+        emb = encode_texts(encoder, batch, device=device)
+        all_embeddings_list.append(emb)
+    all_embeddings: Tensor = torch.cat(all_embeddings_list, dim=0)  # [total_chunks, d]
+
+    # 3. Reassemble per-node chunk tensors and compute mean pooling
+    chunk_embeddings: list[Tensor] = []
+    node_rows: list[Tensor] = []
+    offset = 0
+    for count in node_chunk_counts:
+        node_embs = all_embeddings[offset : offset + count]
+        offset += count
+        chunk_embeddings.append(node_embs)
+        node_rows.append(node_embs.mean(dim=0))
+
+    node_embeddings = torch.stack(node_rows, dim=0)
     return TextBank(
         node_embeddings=node_embeddings,
         chunk_embeddings=chunk_embeddings,
         encoder_name=encoder_name,
-        dim=bank_dim,
+        dim=int(node_embeddings.size(1)),
     )
 
 

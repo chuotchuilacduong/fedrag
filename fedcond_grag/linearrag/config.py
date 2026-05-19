@@ -7,7 +7,7 @@ class LinearRAGConfig:
     llm_model: LLM_Model = None
     chunk_token_size: int = 1000
     chunk_overlap_token_size: int = 100
-    spacy_model: str = "en_core_web_trf"
+    spacy_model: str = "en_core_web_sm"
     working_dir: str = "./import"
     batch_size: int = 128
     max_workers: int = 16

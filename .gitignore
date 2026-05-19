@@ -74,6 +74,14 @@ env/
 .cache/
 processed/
 
+# Datasets (downloaded / derived — too large for git)
+dataset/fedcond_qa/
+dataset/linearrag/hotpotqa/chunks.json
+dataset/linearrag/hotpotqa/questions.json
+
+# Large binary tensors
+*.pt
+
 # Model checkpoints
 checkpoints/
 runs/

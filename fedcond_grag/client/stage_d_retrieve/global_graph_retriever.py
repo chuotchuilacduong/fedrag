@@ -53,6 +53,9 @@ class GlobalGraphRetriever:
         3. Expand seeds 1-hop along edge_index (undirected).
         4. Take induced subgraph with relabeled nodes.
         5. Optionally clamp to max_nodes by keeping highest-scoring seeds first.
+
+    Adjacency lists and normalized embeddings are precomputed in __init__ so
+    repeated retrieve() calls are O(top_r × avg_degree) instead of O(E).
     """
 
     def __init__(
@@ -65,6 +68,25 @@ class GlobalGraphRetriever:
         self._graph = synthetic_graph
         self._top_r = top_r
         self._max_nodes = max_nodes
+
+        # Precompute normalized embeddings once — avoids per-query F.normalize
+        x = synthetic_graph.x
+        if x is not None and x.numel() > 0:
+            self._x_norm = F.normalize(x.float(), dim=-1)  # [K, d]
+        else:
+            self._x_norm = None
+
+        # Precompute adjacency lists for O(deg) 1-hop expansion
+        K = x.size(0) if x is not None and x.numel() > 0 else 0
+        adj: list[list[int]] = [[] for _ in range(K)]
+        edge_index = synthetic_graph.edge_index
+        if edge_index is not None and edge_index.numel() > 0:
+            src_list = edge_index[0].tolist()
+            dst_list = edge_index[1].tolist()
+            for u, v in zip(src_list, dst_list):
+                adj[u].append(v)
+                adj[v].append(u)
+        self._adj = adj
 
     def retrieve(self, query_embedding: Tensor) -> GlobalRetrievalResult:
         """Retrieve a subgraph for a single query embedding.
@@ -80,6 +102,8 @@ class GlobalGraphRetriever:
             query_embedding,
             top_r=self._top_r,
             max_nodes=self._max_nodes,
+            x_norm=self._x_norm,
+            adj=self._adj,
         )
 
     def retrieve_batch(self, query_embeddings: Tensor) -> list[GlobalRetrievalResult]:
@@ -117,6 +141,8 @@ def retrieve_global_subgraph(
         query_embedding,
         top_r=top_r,
         max_nodes=max_nodes,
+        x_norm=None,
+        adj=None,
     )
 
 
@@ -130,6 +156,8 @@ def _retrieve_impl(
     *,
     top_r: int,
     max_nodes: int | None,
+    x_norm: Tensor | None = None,
+    adj: list[list[int]] | None = None,
 ) -> GlobalRetrievalResult:
     """Core retrieval logic shared by class method and convenience function."""
     x: Tensor = graph.x  # [K_g, d]
@@ -163,9 +191,10 @@ def _retrieve_impl(
     # Clamp top_r to K_g
     top_r = min(top_r, K_g)
 
-    # Step 1: Normalize for cosine similarity
-    q = F.normalize(query_embedding.flatten().unsqueeze(0), dim=-1)  # [1, d]
-    x_norm = F.normalize(x, dim=-1)  # [K_g, d]
+    # Step 1: Normalize for cosine similarity (use precomputed if available)
+    q = F.normalize(query_embedding.flatten().unsqueeze(0).float(), dim=-1)  # [1, d]
+    if x_norm is None:
+        x_norm = F.normalize(x.float(), dim=-1)  # [K_g, d]
 
     # Step 2: Cosine similarity scores for ALL nodes
     scores = (x_norm @ q.T).squeeze(-1)  # [K_g]
@@ -174,29 +203,32 @@ def _retrieve_impl(
     seed_scores_vals, seed_idx = torch.topk(scores, top_r)
     # seed_idx: [top_r] — original indices, in descending score order
 
-    # Step 4: 1-hop expansion (undirected)
-    #   For each seed, collect all neighbours in both directions.
-    if edge_index.numel() > 0:
-        seed_set = set(seed_idx.tolist())
+    # Step 4: 1-hop expansion using precomputed adjacency (O(deg)) or tensor scan (O(E))
+    seed_set = set(seed_idx.tolist())
+    if adj is not None:
+        # Fast path: adjacency list lookup — O(top_r × avg_degree)
         neighbor_set: set[int] = set()
+        for s in seed_set:
+            neighbor_set.update(adj[s])
+        kept_set = seed_set | neighbor_set
+    elif edge_index.numel() > 0:
+        # Slow fallback: tensor scan for each seed
+        neighbor_set = set()
         src = edge_index[0]
         dst = edge_index[1]
         for s in seed_set:
-            # Edges where s is source: collect destinations
-            mask_src = src == s
-            neighbor_set.update(dst[mask_src].tolist())
-            # Edges where s is destination: collect sources
-            mask_dst = dst == s
-            neighbor_set.update(src[mask_dst].tolist())
-        # Union: seeds + all 1-hop neighbours
+            neighbor_set.update(dst[src == s].tolist())
+            neighbor_set.update(src[dst == s].tolist())
         kept_set = seed_set | neighbor_set
     else:
-        kept_set = set(seed_idx.tolist())
+        kept_set = seed_set
+
+    dev = x.device  # keep all index tensors on the same device as the graph
 
     # Step 5: Optionally clamp to max_nodes
     if max_nodes is not None and len(kept_set) > max_nodes:
         # Keep the max_nodes nodes with the highest cosine scores
-        all_kept = torch.tensor(sorted(kept_set), dtype=torch.long)
+        all_kept = torch.tensor(sorted(kept_set), dtype=torch.long, device=dev)
         kept_scores = scores[all_kept]
         _, top_idx = torch.topk(kept_scores, min(max_nodes, len(kept_set)))
         kept_set = set(all_kept[top_idx].tolist())
@@ -204,11 +236,11 @@ def _retrieve_impl(
         # Re-derive seed_indices as intersection of kept with original top seeds
         # (preserve original score order)
         new_seeds_ordered = [i for i in seed_idx.tolist() if i in kept_set]
-        seed_idx = torch.tensor(new_seeds_ordered, dtype=torch.long)
+        seed_idx = torch.tensor(new_seeds_ordered, dtype=torch.long, device=dev)
         seed_scores_vals = scores[seed_idx]
 
-    # Build sorted kept_indices
-    kept_indices = torch.sort(torch.tensor(sorted(kept_set), dtype=torch.long)).values
+    # Build sorted kept_indices (must be on same device as edge_index)
+    kept_indices = torch.sort(torch.tensor(sorted(kept_set), dtype=torch.long, device=dev)).values
 
     # Step 6: Extract induced subgraph with relabeled nodes
     if edge_index.numel() > 0:
@@ -220,8 +252,8 @@ def _retrieve_impl(
             num_nodes=K_g,
         )
     else:
-        sub_edge_index = torch.zeros(2, 0, dtype=torch.long)
-        sub_edge_weight = torch.zeros(0)
+        sub_edge_index = torch.zeros(2, 0, dtype=torch.long, device=dev)
+        sub_edge_weight = torch.zeros(0, device=dev)
 
     sub_x = x[kept_indices]
     sub_node_type = node_type[kept_indices]

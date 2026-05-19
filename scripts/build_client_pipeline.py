@@ -88,7 +88,7 @@ def build_trigraph(client_dir: Path, dataset: str, force: bool) -> Data:
 # Stage B — Client condensation
 # ---------------------------------------------------------------------------
 
-def build_condensed(client_dir: Path, graph: Data, force: bool, topology_method: str = "knn") -> dict:
+def build_condensed(client_dir: Path, graph: Data, force: bool, topology_method: str = "knn", entity_ratio: float = 0.05) -> dict:
     out = client_dir / "condensed_graph.pt"
     if out.exists() and not force:
         print(f"    [B] condensed_graph.pt exists — skipping")
@@ -111,9 +111,13 @@ def build_condensed(client_dir: Path, graph: Data, force: bool, topology_method:
         save_text_bank(bank, bank_path)
         print(f"    [B] Text bank built in {time.time()-t:.0f}s")
 
-    print(f"    [B] Running client condensation ({topology_method} topology)...")
+    from fedcond_grag.client.stage_b_condense.motif_core_selector import MotifSelectorConfig
+    n_ent = int((graph.node_type == 0).sum().item())
+    k_ent = max(1, int(entity_ratio * n_ent))
+    print(f"    [B] Running client condensation ({topology_method} topology, entity_ratio={entity_ratio:.3f}, core_entities={k_ent}/{n_ent})...")
     t = time.time()
-    cfg = ClientCondensationConfig(topology_method=topology_method, knn_k=8)
+    motif_cfg = MotifSelectorConfig(entity_ratio=entity_ratio)
+    cfg = ClientCondensationConfig(topology_method=topology_method, knn_k=8, motif=motif_cfg)
     condensed, _ = condense_client_graph(
         graph,
         text_bank=bank,
@@ -229,7 +233,7 @@ def build_synthetic(client_dir: Path, condensed_payload: dict, force: bool) -> N
 # Main
 # ---------------------------------------------------------------------------
 
-def process_client(dataset: str, client_id: int, force: bool, topology_method: str = "knn") -> None:
+def process_client(dataset: str, client_id: int, force: bool, topology_method: str = "knn", entity_ratio: float = 0.05) -> None:
     client_dir = PROCESSED_ROOT / dataset / f"client_{client_id}"
     if not (client_dir / "chunks.json").exists():
         print(f"  [client_{client_id}] No chunks.json — skipping")
@@ -237,7 +241,7 @@ def process_client(dataset: str, client_id: int, force: bool, topology_method: s
 
     print(f"\n=== client_{client_id} ===")
     graph = build_trigraph(client_dir, dataset, force)
-    condensed = build_condensed(client_dir, graph, force, topology_method=topology_method)
+    condensed = build_condensed(client_dir, graph, force, topology_method=topology_method, entity_ratio=entity_ratio)
     build_synthetic(client_dir, condensed, force)
     print(f"  client_{client_id} done.")
 
@@ -253,6 +257,9 @@ def main() -> None:
     parser.add_argument("--topology-method", default="knn",
                         choices=["knn", "self_expression"],
                         help="Stage B topology reconstruction method")
+    parser.add_argument("--entity-ratio", type=float, default=0.05,
+                        help="Fraction of entity nodes to use as Stage B core (default: 0.05). "
+                             "Lower = fewer core nodes = faster Stage B (e.g. 0.01 is ~5x faster).")
     args = parser.parse_args()
 
     dataset_dir = PROCESSED_ROOT / args.dataset
@@ -272,7 +279,7 @@ def main() -> None:
 
     t0 = time.time()
     for cid in client_ids:
-        process_client(args.dataset, cid, args.force, topology_method=args.topology_method)
+        process_client(args.dataset, cid, args.force, topology_method=args.topology_method, entity_ratio=args.entity_ratio)
 
     print(f"\nAll done in {time.time()-t0:.0f}s")
     print(f"Outputs in: {dataset_dir}")

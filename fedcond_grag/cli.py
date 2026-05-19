@@ -15,6 +15,11 @@ from __future__ import annotations
 import argparse
 import gc
 import sys
+from pathlib import Path
+
+# Allow running as `python fedcond_grag/cli.py` from the project root
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,9 +41,37 @@ def main(argv: list[str] | None = None) -> int:
 # ---------------------------------------------------------------------------
 
 def _run_preprocess(argv: list[str]) -> int:
+    import argparse
     import runpy
-    import scripts.build_client_pipeline as _   # ensure module is on sys.path
-    sys.argv = ["build_client_pipeline.py", *argv]
+
+    # Parse --dataset and --num-clients before forwarding to sub-scripts
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--dataset", default="hotpotqa")
+    p.add_argument("--num-clients", dest="num_clients", type=int, default=2)
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--topology-method", dest="topology_method", default="knn")
+    p.add_argument("--entity-ratio", dest="entity_ratio", type=float, default=0.05)
+    known, _ = p.parse_known_args(argv)
+
+    # Step 0: split raw LinearRAG data into per-client chunks (idempotent)
+    import scripts.preprocess_data as _pd  # noqa: F401  ensure on sys.path
+    sys.argv = [
+        "preprocess_data.py",
+        "--dataset", known.dataset,
+        "--num_clients", str(known.num_clients),
+    ]
+    runpy.run_module("scripts.preprocess_data", run_name="__main__")
+
+    # Step 1-3: Stage A (trigraph) → B (condense) → C (synthetic) per client
+    import scripts.build_client_pipeline as _bp  # noqa: F401
+    build_argv = ["build_client_pipeline.py", "--dataset", known.dataset]
+    if known.force:
+        build_argv.append("--force")
+    if known.topology_method != "knn":
+        build_argv += ["--topology-method", known.topology_method]
+    if known.entity_ratio != 0.05:
+        build_argv += ["--entity-ratio", str(known.entity_ratio)]
+    sys.argv = build_argv
     runpy.run_module("scripts.build_client_pipeline", run_name="__main__")
     return 0
 
@@ -84,6 +117,10 @@ def _run_fl_train(argv: list[str]) -> int:
     p.add_argument("--retrieval-top-r", dest="retrieval_top_r", type=int, default=16)
     p.add_argument("--max-txt-len", dest="max_txt_len", type=int, default=512)
     p.add_argument("--max-new-tokens", dest="max_new_tokens", type=int, default=32)
+    p.add_argument("--max-train-per-client", dest="max_train_per_client", type=int, default=0,
+                   help="Cap training samples per client per round (0 = all)")
+    p.add_argument("--max-eval-samples", dest="max_eval_samples", type=int, default=200,
+                   help="Max eval samples for per-round accuracy (default 200)")
     args = p.parse_args(argv)
 
     from fedcond_grag.trainer import FedTrainer
@@ -153,7 +190,7 @@ def _stage_d_train(args) -> None:
     val_loader   = DataLoader(val_dataset,   batch_size=args.batch_size,      drop_last=False, pin_memory=True, shuffle=False, collate_fn=collate_fn)
     test_loader  = DataLoader(test_dataset,  batch_size=args.eval_batch_size, drop_last=False, pin_memory=True, shuffle=False, collate_fn=collate_fn)
 
-    args.llm_model_path = llama_model_path[args.llm_model_name]
+    args.llm_model_path = getattr(args, "llm_model_path", "") or llama_model_path[args.llm_model_name]
     model = load_model[args.model_name](graph_type=dataset.graph_type, args=args, init_prompt=dataset.prompt)
 
     params = [p for _, p in model.named_parameters() if p.requires_grad]
@@ -264,7 +301,7 @@ def _stage_d_infer(args) -> None:
     test_dataset = [dataset[i] for i in idx_split["test"]]
     test_loader = DataLoader(test_dataset, batch_size=args.eval_batch_size, drop_last=False, pin_memory=True, shuffle=False, collate_fn=collate_fn)
 
-    args.llm_model_path = llama_model_path[args.llm_model_name]
+    args.llm_model_path = getattr(args, "llm_model_path", "") or llama_model_path[args.llm_model_name]
     model = load_model[args.model_name](graph=dataset.graph, graph_type=dataset.graph_type, args=args)
 
     os.makedirs(f"{args.output_dir}/{args.dataset}", exist_ok=True)

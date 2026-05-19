@@ -9,12 +9,14 @@ Round >= 1 — FL loop: each sampled client loads aggregated model weights,
              weights and re-runs Stage C with the updated surrogate to refine
              the synthetic graph.
 
-The shared LLM (frozen) is instantiated once inside FedTrainer and passed by
-reference to all clients so that only one copy lives in memory.
+Per-round metrics logged: avg_loss, per-client losses, train_acc, val_acc,
+test_acc. Written to /tmp/fl_metrics.jsonl for offline analysis.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import random
 import time
 from pathlib import Path
@@ -47,10 +49,31 @@ class FedTrainer:
         global_data, global_dir = self._load_global_data()
         self.server = FedCondQAServer(args, global_data, global_dir, self.message_pool, self.device)
 
-        # Stage D setup: load shared LLM + partition QA data (only if num_rounds > 1)
+        # Stage D fields
         self.shared_model = None
+        self._train_eval_samples: list = []
+        self._val_samples: list = []
+        self._test_samples: list = []
         if int(getattr(args, "num_rounds", 1)) > 1:
             self._init_stage_d()
+
+        self._metrics_path = Path(getattr(args, "metrics_path", "/tmp/fl_metrics.jsonl"))
+        self._metrics_path.write_text("")   # reset on new run
+
+        self._load_dotenv()
+        self._wandb = None
+        if os.environ.get("WANDB_API_KEY"):
+            try:
+                import wandb
+                self._wandb = wandb.init(
+                    project=os.environ.get("WANDB_PROJECT", getattr(args, "wandb_project", "fedcond-graphrag")),
+                    name=getattr(args, "wandb_run_name", None),
+                    config=vars(args) if hasattr(args, "__dict__") else {},
+                    resume="allow",
+                )
+                print(f"[wandb] run: {self._wandb.url}", flush=True)
+            except Exception as exc:
+                print(f"[wandb] init failed, continuing without: {exc}", flush=True)
 
     # ------------------------------------------------------------------
     # Main training loop
@@ -59,48 +82,182 @@ class FedTrainer:
     def train(self) -> None:
         num_rounds = int(getattr(self.args, "num_rounds", 1))
         client_frac = float(getattr(self.args, "client_frac", 1.0))
+        round_metrics: list[dict] = []
 
         for round_id in range(num_rounds):
             sampled = sorted(random.sample(
                 range(self.args.num_clients),
                 max(1, int(self.args.num_clients * client_frac)),
             ))
-            print(f"\n=== round {round_id} | sampled clients: {sampled} ===")
+            print(f"\n=== round {round_id} | sampled clients: {sampled} ===", flush=True)
 
             self.message_pool["round"] = round_id
             self.message_pool["sampled_clients"] = sampled
 
-            # Server broadcasts synthetic graph + aggregated weights (empty in round 0)
             self.server.send_message()
 
+            client_losses: dict[int, float] = {}
             for cid in sampled:
                 t0 = time.perf_counter()
-
-                # Load synthetic graph + aggregated weights from server
                 self.clients[cid].receive_message()
-
-                # Stage B: refresh anchor graph when due
                 self.clients[cid].execute()
 
-                # Stage D: local training from round 1 onwards
+                loss = 0.0
                 if round_id >= 1 and self.shared_model is not None:
-                    self.clients[cid].local_train()
+                    loss = self.clients[cid].local_train()
+                    client_losses[cid] = loss
 
                 self.clients[cid].send_message()
-                print(f"    client_{cid} done in {time.perf_counter() - t0:.1f}s")
+                loss_str = f" | loss: {loss:.4f}" if round_id >= 1 else ""
+                print(f"    client_{cid}{loss_str} | {time.perf_counter() - t0:.1f}s", flush=True)
 
             t0 = time.perf_counter()
-            # Stage C: gradient matching → update synthetic graph; FedAvg model weights
             self.server.execute()
-            print(f"    server agg done in {time.perf_counter() - t0:.1f}s")
+            print(f"    server agg done in {time.perf_counter() - t0:.1f}s", flush=True)
+
+            train_acc = val_acc = test_acc = None
+            if round_id >= 1 and self.shared_model is not None:
+                if self._train_eval_samples:
+                    train_acc = self._eval_split_acc(self._train_eval_samples)
+                    print(f"    train acc : {train_acc:.1f}%", flush=True)
+                if self._val_samples:
+                    val_acc = self._eval_split_acc(self._val_samples)
+                    print(f"    val   acc : {val_acc:.1f}%", flush=True)
+                if self._test_samples:
+                    test_acc = self._eval_split_acc(self._test_samples)
+                    print(f"    test  acc : {test_acc:.1f}%", flush=True)
+
+            avg_loss = (
+                sum(client_losses.values()) / len(client_losses) if client_losses else None
+            )
+            metrics = {
+                "round": round_id,
+                "avg_loss": avg_loss,
+                "client_losses": dict(client_losses),
+                "train_acc": train_acc,
+                "val_acc": val_acc,
+                "test_acc": test_acc,
+            }
+            round_metrics.append(metrics)
+            self._log_metrics(metrics)
+
+        self._print_metrics_table(round_metrics)
+
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+
+    def _eval_split_acc(self, samples: list) -> float:
+        """Distribute samples across clients, run inference with on-the-fly retrieval."""
+        from fedcond_grag.client.stage_d_retrieve.global_graph_retriever import GlobalGraphRetriever
+        from fedcond_grag.utils.collate import collate_fn
+
+        batch_size = int(getattr(self.args, "local_batch_size", 4))
+        top_r = int(getattr(self.args, "retrieval_top_r", 16))
+        n_clients = len(self.clients)
+        hits = 0
+        self.shared_model.eval()
+
+        with torch.no_grad():
+            for cid, client in enumerate(self.clients):
+                shard = [s for i, s in enumerate(samples) if i % n_clients == cid]
+                if not shard:
+                    continue
+                # Precompute evidence graphs for the whole shard in one GPU pass
+                shard = client._attach_evidence_graphs(shard)
+                syn_retriever = (
+                    GlobalGraphRetriever(client.synthetic_graph, top_r=top_r)
+                    if client.synthetic_graph is not None else None
+                )
+                for i in range(0, len(shard), batch_size):
+                    mini = shard[i : i + batch_size]
+                    if syn_retriever is not None:
+                        mini = client._attach_condensed_graphs(mini, syn_retriever)
+                    batch = collate_fn(mini)
+                    out = self.shared_model.inference(batch)
+                    for pred, label in zip(out["pred"], out["label"]):
+                        if label.strip().lower() in pred.strip().lower():
+                            hits += 1
+
+        return 100.0 * hits / max(len(samples), 1)
+
+    def _log_metrics(self, metrics: dict) -> None:
+        with self._metrics_path.open("a") as f:
+            f.write(json.dumps(metrics) + "\n")
+        if self._wandb is not None:
+            log = {"round": metrics["round"]}
+            if metrics["avg_loss"] is not None:
+                log["avg_loss"] = metrics["avg_loss"]
+                for cid, loss in metrics["client_losses"].items():
+                    log[f"client_{cid}_loss"] = loss
+            if metrics["train_acc"] is not None:
+                log["train_acc"] = metrics["train_acc"]
+            if metrics["val_acc"] is not None:
+                log["val_acc"] = metrics["val_acc"]
+            if metrics["test_acc"] is not None:
+                log["test_acc"] = metrics["test_acc"]
+            self._wandb.log(log, step=metrics["round"])
+
+    def _print_metrics_table(self, round_metrics: list[dict]) -> None:
+        W = 95
+        n = self.args.num_clients
+        print("\n" + "=" * W)
+        print("FEDERATED TRAINING SUMMARY")
+        print("=" * W)
+        hdr = f"{'Rnd':>4} | {'AvgLoss':>8} |"
+        for cid in range(n):
+            hdr += f" {'C'+str(cid)+'Loss':>8} |"
+        hdr += f" {'Train%':>7} | {'Val%':>7} | {'Test%':>7}"
+        print(hdr)
+        print("-" * W)
+        for m in round_metrics:
+            if m["avg_loss"] is None:
+                print(f"{m['round']:>4} | {'(boot)':>8} |" + f" {'—':>8} |" * n +
+                      f" {'—':>7} | {'—':>7} | {'—':>7}")
+                continue
+            row = f"{m['round']:>4} | {m['avg_loss']:>8.4f} |"
+            for cid in range(n):
+                v = m["client_losses"].get(cid, float("nan"))
+                row += f" {v:>8.4f} |"
+            def _f(v):
+                return f"{v:>6.1f}%" if v is not None else f"{'N/A':>7}"
+            row += f" {_f(m['train_acc'])} | {_f(m['val_acc'])} | {_f(m['test_acc'])}"
+            print(row)
+        print("=" * W)
+        print(f"Full metrics → {self._metrics_path}")
+
+        if self.shared_model is None or not self._test_samples:
+            return
+        from fedcond_grag.utils.collate import collate_fn
+        from fedcond_grag.client.stage_d_retrieve.global_graph_retriever import GlobalGraphRetriever
+        top_r = int(getattr(self.args, "retrieval_top_r", 16))
+        n_show = min(10, len(self._test_samples))
+        mini = list(self._test_samples[:n_show])
+        client = self.clients[0]
+        mini = client._attach_evidence_graphs(mini)
+        if client.synthetic_graph is not None:
+            r = GlobalGraphRetriever(client.synthetic_graph, top_r=top_r)
+            mini = client._attach_condensed_graphs(mini, r)
+        batch = collate_fn(mini)
+        self.shared_model.eval()
+        with torch.no_grad():
+            out = self.shared_model.inference(batch)
+        print("\nSAMPLE PREDICTIONS (test, first 10)")
+        print("-" * W)
+        for i in range(n_show):
+            q  = out["question"][i][:80].replace("\n", " ")
+            gt = out["label"][i]
+            pr = out["pred"][i][:80].replace("\n", " ")
+            hit = "✓" if gt.strip().lower() in pr.strip().lower() else "✗"
+            print(f"[{i+1:>2}] {hit} Q : {q}")
+            print(f"       GT: {gt}  |  PR: {pr}")
+        print()
 
     # ------------------------------------------------------------------
     # Stage D initialisation
     # ------------------------------------------------------------------
 
     def _init_stage_d(self) -> None:
-        """Load shared DualGraphLLM and distribute QA data to clients."""
-        # 1. Load QA dataset
         from fedcond_grag.dataloader import FedCondQADataset
         qa_root = getattr(self.args, "qa_data_root", "dataset/fedcond_qa")
         try:
@@ -109,14 +266,33 @@ class FedTrainer:
             print(f"[FedTrainer] Stage D disabled: QA dataset not found — {exc}")
             return
 
-        # 2. Partition samples to clients by index % num_clients
-        n = self.args.num_clients
-        for cid, client in enumerate(self.clients):
-            client_samples = [qa_dataset[i] for i in range(len(qa_dataset)) if i % n == cid]
-            client.set_local_qa_data(client_samples)
-            print(f"    client_{cid}: {len(client_samples)} QA samples")
+        split_dir = Path(qa_root) / "split"
 
-        # 3. Load shared DualGraphLLM (frozen LLM, trainable GNN + projectors)
+        def _load_idx(fname):
+            p = split_dir / fname
+            return [int(l.strip()) for l in p.read_text().splitlines() if l.strip()] if p.exists() else []
+
+        train_idx = sorted(set(_load_idx("train_indices.txt")))
+        val_idx   = _load_idx("val_indices.txt")
+        test_idx  = _load_idx("test_indices.txt")
+
+        max_eval = int(getattr(self.args, "max_eval_samples", 200))
+        self._train_eval_samples = [qa_dataset[i] for i in train_idx[:max_eval] if i < len(qa_dataset)]
+        self._val_samples        = [qa_dataset[i] for i in val_idx[:max_eval]   if i < len(qa_dataset)]
+        self._test_samples       = [qa_dataset[i] for i in test_idx[:max_eval]  if i < len(qa_dataset)]
+        print(f"    eval sets — train: {len(self._train_eval_samples)}, "
+              f"val: {len(self._val_samples)}, test: {len(self._test_samples)} (capped {max_eval})")
+
+        n = self.args.num_clients
+        max_per = int(getattr(self.args, "max_train_per_client", 0))
+        for cid, client in enumerate(self.clients):
+            cid_indices = [i for i in train_idx if i % n == cid]
+            if max_per > 0:
+                cid_indices = cid_indices[:max_per]
+            samples = [qa_dataset[i] for i in cid_indices]
+            client.set_local_qa_data(samples)
+            print(f"    client_{cid}: {len(samples)} QA train samples")
+
         try:
             from fedcond_grag.model import load_model, llama_model_path
         except ImportError as exc:
@@ -126,27 +302,19 @@ class FedTrainer:
         llm_name = getattr(self.args, "llm_model_name", "7b")
         llm_path = getattr(self.args, "llm_model_path", "") or llama_model_path.get(llm_name, "")
         if not llm_path:
-            print(f"[FedTrainer] Stage D disabled: llm_model_path not set")
+            print("[FedTrainer] Stage D disabled: llm_model_path not set")
             return
 
         self.args.llm_model_path = llm_path
-        # Ensure Stage D GNN args have defaults if not set
         for attr, default in (
-            ("gnn_model_name", "gt"),
-            ("gnn_model_name_c", "gat"),
-            ("gnn_num_layers", 4),
-            ("gnn_num_layers_c", None),
-            ("gnn_in_dim", 384),
-            ("gnn_in_dim_c", None),
-            ("gnn_hidden_dim", 384),
-            ("gnn_hidden_dim_c", None),
-            ("gnn_num_heads", 4),
-            ("gnn_num_heads_c", None),
-            ("gnn_dropout", 0.0),
-            ("dual_graph_mode", "both"),
-            ("max_txt_len", 512),
-            ("max_new_tokens", 32),
-            ("llm_frozen", "True"),
+            ("gnn_model_name",   "gt"),   ("gnn_model_name_c",  "gat"),
+            ("gnn_num_layers",   4),      ("gnn_num_layers_c",  None),
+            ("gnn_in_dim",       384),    ("gnn_in_dim_c",      None),
+            ("gnn_hidden_dim",   384),    ("gnn_hidden_dim_c",  None),
+            ("gnn_num_heads",    4),      ("gnn_num_heads_c",   None),
+            ("gnn_dropout",      0.0),    ("dual_graph_mode",   "both"),
+            ("max_txt_len",      512),    ("max_new_tokens",    32),
+            ("llm_frozen",       "True"),
         ):
             if not hasattr(self.args, attr):
                 setattr(self.args, attr, default)
@@ -157,39 +325,51 @@ class FedTrainer:
             print(f"[FedTrainer] Stage D disabled: failed to load DualGraphLLM — {exc}")
             return
 
-        # Freeze everything except GNN + projectors
         for name, param in model.named_parameters():
-            is_gnn = any(
-                name.startswith(k)
-                for k in ("graph_encoder", "projector", "condensed_encoder", "projector_c")
+            param.requires_grad = any(
+                name.startswith(k) for k in
+                ("graph_encoder", "projector", "condensed_encoder", "projector_c")
             )
-            param.requires_grad = is_gnn
 
-        model.to(self.device)
+        if not hasattr(model, "hf_device_map"):
+            model.to(self.device)
         self.shared_model = model
 
-        # Give each client a reference + snapshot of initial weights
         for client in self.clients:
             client.set_shared_model(model)
 
-        print(f"[FedTrainer] Stage D ready — shared DualGraphLLM loaded on {self.device}")
+        print(f"[FedTrainer] Stage D ready — shared DualGraphLLM on {self.device}")
 
     # ------------------------------------------------------------------
     # Data loading helpers
     # ------------------------------------------------------------------
+
+    def _load_dotenv(self) -> None:
+        """Load .env from project root into os.environ without overwriting existing vars."""
+        env_path = Path(__file__).resolve().parent.parent / ".env"
+        if not env_path.exists():
+            return
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+            if key and val and key not in os.environ:
+                os.environ[key] = val
 
     def _processed_root(self) -> Path:
         return Path(getattr(self.args, "data_root", "processed")) / self.args.dataset
 
     def _load_client_data(self, client_id: int):
         from torch_geometric.data import Data
-
         client_dir = self._processed_root() / f"client_{client_id}"
         path = client_dir / "trigraph.pt"
         if not path.exists():
             raise FileNotFoundError(
                 f"Missing trigraph for client {client_id}: {path}. "
-                f"Run `python main.py preprocess --dataset {self.args.dataset}` first."
+                f"Run `fedcond_grag preprocess --dataset {self.args.dataset}` first."
             )
         payload = torch.load(path, map_location="cpu", weights_only=False)
         data = Data(
