@@ -13,8 +13,8 @@ from torch.nn.utils import clip_grad_norm_
 from torch_geometric.data import Data
 
 from fedcond_grag.server.stage_c_aggregate.task import CondensationQATask
-from fedcond_grag.client.stage_b_condense import ClientCondensationConfig, ClientCondensor, MotifSelectorConfig
-from fedcond_grag.client.stage_b_condense.text_bank import TextBank, build_text_bank, load_frozen_encoder
+from fedcond_grag.client.stage_b_condense import ClientCondensationConfig, ClientCondensor, AnchorSelectorConfig
+from fedcond_grag.client.stage_b_condense.node_text_embedder import NodeTextBank, build_text_bank, load_frozen_encoder
 from fedcond_grag.client.stage_d_retrieve.global_graph_retriever import GlobalGraphRetriever
 from fedcond_grag.utils.collate import collate_fn
 
@@ -39,7 +39,7 @@ class FedCondQAClient:
         self.task = CondensationQATask(args, client_id, data, data_dir, device)
         self.tri_graph = self.task.splitted_data["data"]
         self.condensed_graph = None
-        self.text_bank: TextBank | None = None
+        self.text_bank: NodeTextBank | None = None
         self.condensor: ClientCondensor | None = None
 
         # Stage D fields (populated by FedTrainer after LLM is loaded)
@@ -49,6 +49,13 @@ class FedCondQAClient:
         self._model_weights: dict | None = None   # per-client GNN/proj state dicts
         self._num_local_samples: int = 0
         self._local_adj: list | None = None    # CPU adjacency lists for trigraph
+        # AdamW persisted across rounds — Adam's v_t needs many steps to warm
+        # up; rebuilding it every round (the old behaviour) kept it permanently
+        # cold and effective LR ≈ 0.
+        self._optimizer: torch.optim.Optimizer | None = None
+        # Full pool of pre-attached train samples (evidence graphs attached once
+        # at startup). Each round we randomly sample max_per from this pool.
+        self._train_pool: list = []
 
     # ------------------------------------------------------------------
     # Setup helpers (called by FedTrainer)
@@ -59,14 +66,42 @@ class FedCondQAClient:
         self.local_qa_samples = self._attach_evidence_graphs(samples)
         self._num_local_samples = len(samples)
 
+    def set_full_train_pool(self, samples: list, max_per_round: int | None = None) -> None:
+        """Pre-attach evidence graphs for all train samples (done once at startup).
+
+        Each round, call sample_train_for_round(n) to pick a fresh random
+        subset so all samples are covered over many FL rounds.
+        """
+        print(f"    client_{self.client_id}: attaching evidence graphs for "
+              f"{len(samples)} train samples (one-time startup cost)...", flush=True)
+        self._train_pool = self._attach_evidence_graphs(samples)
+        n = max_per_round if max_per_round and max_per_round < len(self._train_pool) else len(self._train_pool)
+        self._num_local_samples = n
+        self.sample_train_for_round(n)
+        print(f"    client_{self.client_id}: pool={len(self._train_pool)}, "
+              f"per-round budget={n}", flush=True)
+
+    def sample_train_for_round(self, n: int | None = None) -> None:
+        """Pick a fresh random subset of n samples from the full train pool."""
+        if not self._train_pool:
+            return
+        pool = self._train_pool
+        if n is None or n >= len(pool):
+            self.local_qa_samples = list(pool)
+        else:
+            self.local_qa_samples = random.sample(pool, n)
+        self._num_local_samples = len(self.local_qa_samples)
+
     def set_shared_model(self, model: "DualGraphLLM") -> None:
         """Store reference to the shared LLM and snapshot initial weights."""
         self.shared_model = model
         self._model_weights = {
             "graph_encoder": copy.deepcopy(model.graph_encoder.state_dict()),
             "projector": copy.deepcopy(model.projector.state_dict()),
-            "condensed_encoder": copy.deepcopy(model.condensed_encoder.state_dict()),
-            "projector_c": copy.deepcopy(model.projector_c.state_dict()),
+            **({"condensed_encoder": copy.deepcopy(model.condensed_encoder.state_dict())}
+               if model.condensed_encoder is not None else {}),
+            **({"projector_c": copy.deepcopy(model.projector_c.state_dict())}
+               if model.projector_c is not None else {}),
         }
 
     # ------------------------------------------------------------------
@@ -109,10 +144,14 @@ class FedCondQAClient:
             + time.perf_counter() - start
         )
 
-    def local_train(self) -> float:
-        """Stage D: train GNN encoder + projector on local QA data. Returns avg loss."""
+    def local_train(self, log_fn=None, global_step_start: int = 0) -> tuple[float, int]:
+        """Stage D: train GNN encoder + projector on local QA data.
+
+        Returns (avg_loss, steps_taken). global_step_start offsets the WandB
+        x-axis so steps are monotone across all clients and rounds.
+        """
         if self.shared_model is None or not self.local_qa_samples:
-            return 0.0
+            return 0.0, 0
 
         # Load this client's weights into the shared model
         self._load_weights_into_model()
@@ -130,48 +169,91 @@ class FedCondQAClient:
         trainable = (
             list(self.shared_model.graph_encoder.parameters())
             + list(self.shared_model.projector.parameters())
-            + list(self.shared_model.condensed_encoder.parameters())
-            + list(self.shared_model.projector_c.parameters())
+            + (list(self.shared_model.condensed_encoder.parameters())
+               if self.shared_model.condensed_encoder is not None else [])
+            + (list(self.shared_model.projector_c.parameters())
+               if self.shared_model.projector_c is not None else [])
         )
-        optimizer = torch.optim.AdamW(
-            trainable,
-            lr=float(getattr(self.args, "local_lr", 1e-5)),
-            weight_decay=float(getattr(self.args, "local_wd", 0.05)),
-        )
+        if self._optimizer is None:
+            self._optimizer = torch.optim.AdamW(
+                trainable,
+                lr=float(getattr(self.args, "local_lr", 1e-4)),
+                weight_decay=float(getattr(self.args, "local_wd", 0.05)),
+                betas=(0.9, 0.95),
+            )
+        optimizer = self._optimizer
 
-        local_epochs = int(getattr(self.args, "local_epochs", 1))
+        local_epochs = int(getattr(self.args, "local_epochs", 3))
         batch_size = int(getattr(self.args, "local_batch_size", 4))
-        grad_clip = float(getattr(self.args, "local_grad_clip", 0.1))
+        grad_clip = float(getattr(self.args, "local_grad_clip", 1.0))
+
+        # Pre-attach condensed graphs ONCE per round — within a round the
+        # synthetic graph is fixed and per-sample retrieval results don't
+        # change between epochs/batches. Calling it per mini-batch (the old
+        # behaviour) ran the same retrieval `epochs * ceil(N/bs)` times.
+        if retriever is not None:
+            base_samples = self._attach_condensed_graphs(
+                list(self.local_qa_samples), retriever
+            )
+        else:
+            base_samples = list(self.local_qa_samples)
 
         self.shared_model.train()
         total_loss = 0.0
         total_steps = 0
-        for _ in range(local_epochs):
-            samples = list(self.local_qa_samples)   # graphs already attached
+        steps_per_epoch = (len(base_samples) + batch_size - 1) // batch_size
+        total_planned = steps_per_epoch * local_epochs
+        log_every = max(1, steps_per_epoch // 10)   # ~10 prints per epoch
+        t_start = time.perf_counter()
+        for epoch in range(local_epochs):
+            samples = list(base_samples)
             random.shuffle(samples)
             for i in range(0, len(samples), batch_size):
                 mini = samples[i : i + batch_size]
-                if retriever is not None:
-                    mini = self._attach_condensed_graphs(mini, retriever)
                 batch = collate_fn(mini)
                 optimizer.zero_grad()
                 loss = self.shared_model(batch)
                 loss.backward()
                 clip_grad_norm_(trainable, grad_clip)
                 optimizer.step()
-                total_loss += loss.item()
+                step_loss = loss.item()
+                total_loss += step_loss
                 total_steps += 1
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                if log_fn is not None:
+                    log_fn(
+                        {
+                            f"train/client_{self.client_id}_step_loss": step_loss,
+                            "train/step_loss": step_loss,
+                        },
+                        step=global_step_start + total_steps - 1,
+                    )
+                if total_steps % log_every == 0 or total_steps == total_planned:
+                    elapsed = time.perf_counter() - t_start
+                    sps = total_steps / elapsed
+                    eta = (total_planned - total_steps) / sps if sps > 0 else 0
+                    avg = total_loss / total_steps
+                    print(
+                        f"    [client_{self.client_id}] ep{epoch+1} "
+                        f"step {total_steps}/{total_planned} | "
+                        f"loss {avg:.4f} | {sps:.2f} s/s | "
+                        f"ETA {eta/60:.1f}m",
+                        flush=True,
+                    )
+                # NOTE: torch.cuda.empty_cache() removed — it forces a full
+                # CUDA sync after every step. The PyTorch caching allocator
+                # already reuses freed blocks; calling empty_cache() just
+                # gives memory back to the driver and re-allocates next step.
 
-        # Snapshot updated weights back into per-client state
+        # Snapshot updated weights — skip components that don't exist (shared mode)
         self._model_weights = {
             "graph_encoder": copy.deepcopy(self.shared_model.graph_encoder.state_dict()),
             "projector": copy.deepcopy(self.shared_model.projector.state_dict()),
-            "condensed_encoder": copy.deepcopy(self.shared_model.condensed_encoder.state_dict()),
-            "projector_c": copy.deepcopy(self.shared_model.projector_c.state_dict()),
+            **({"condensed_encoder": copy.deepcopy(self.shared_model.condensed_encoder.state_dict())}
+               if self.shared_model.condensed_encoder is not None else {}),
+            **({"projector_c": copy.deepcopy(self.shared_model.projector_c.state_dict())}
+               if self.shared_model.projector_c is not None else {}),
         }
-        return total_loss / max(total_steps, 1)
+        return total_loss / max(total_steps, 1), total_steps
 
     def send_message(self) -> None:
         if self.condensed_graph is None:
@@ -198,19 +280,26 @@ class FedCondQAClient:
         assert self.shared_model is not None and self._model_weights is not None
         self.shared_model.graph_encoder.load_state_dict(self._model_weights["graph_encoder"])
         self.shared_model.projector.load_state_dict(self._model_weights["projector"])
-        self.shared_model.condensed_encoder.load_state_dict(self._model_weights["condensed_encoder"])
-        self.shared_model.projector_c.load_state_dict(self._model_weights["projector_c"])
+        if self.shared_model.condensed_encoder is not None and "condensed_encoder" in self._model_weights:
+            self.shared_model.condensed_encoder.load_state_dict(self._model_weights["condensed_encoder"])
+        if self.shared_model.projector_c is not None and "projector_c" in self._model_weights:
+            self.shared_model.projector_c.load_state_dict(self._model_weights["projector_c"])
 
     def _attach_evidence_graphs(self, samples: list) -> list:
-        """Batch-retrieve evidence subgraphs for all samples in one GPU matmul.
+        """Build per-sample evidence subgraphs anchored on top-r passage nodes.
 
-        Steps:
-          1. Stack q_embs → [B, 384], score vs trigraph x_norm on GPU → [N, B]
-          2. topk → seed indices per query (GPU)
-          3. 1-hop expand + edge extraction via CPU adj list — O(|kept| × deg)
-          4. Move resulting subgraphs to self.device
+        Two seed sources (used independently per sample, anchor-first):
+          1. Anchor nodes — sample["anchor_passage_nodes"] is a list of
+             (client_id, node_id) for the top-r question-relevant passages.
+             We keep only those whose client_id == self.client_id (i.e., live
+             on this client's trigraph).
+          2. Fallback — if no anchor nodes are local, fall back to the legacy
+             q_emb-vs-trigraph top-r retrieval so the graph path still works.
 
-        x_norm is materialised on GPU only during this call, then freed.
+        From the seed set we do 1-hop expansion in the local trigraph and
+        return a CPU Data with x / edge_index / edge_weight / node_type /
+        node_text preserved. node_text is needed downstream for any future
+        text injection of retrieved nodes.
         """
         import torch.nn.functional as F
         from torch_geometric.data import Data as _Data
@@ -229,50 +318,57 @@ class FedCondQAClient:
                 adj[v].append(u)
             self._local_adj = adj
 
-        q_embs = [s.get("q_emb") for s in samples]
-        has_emb = [q is not None for q in q_embs]
-        if not any(has_emb):
-            return samples
-
-        # --- GPU batch scoring ---
-        valid_qs = torch.stack([q for q in q_embs if q is not None]).float()  # [B, 384]
-        x = self.tri_graph.x.float()
-        x_norm_gpu = F.normalize(x, dim=-1).to(self.device)          # [N, 384] GPU
-        q_norm_gpu = F.normalize(valid_qs, dim=-1).to(self.device)   # [B, 384] GPU
-
-        top_r = int(getattr(self.args, "retrieval_top_r", 16))
-        top_r = min(top_r, x_norm_gpu.size(0))
-
-        # Process in blocks to avoid OOM on very large trigraphs
-        BLOCK = 512
-        topk_parts: list[torch.Tensor] = []
-        for start in range(0, q_norm_gpu.size(0), BLOCK):
-            q_block = q_norm_gpu[start : start + BLOCK]          # [b, 384]
-            scores = x_norm_gpu @ q_block.T                      # [N, b]
-            topk_parts.append(torch.topk(scores, top_r, dim=0).indices.T.cpu())  # [b, top_r]
-        topk_idx = torch.cat(topk_parts, dim=0)                  # [B, top_r]
-
-        del x_norm_gpu, q_norm_gpu
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()
-
-        # --- CPU subgraph extraction ---
-        x_cpu = self.tri_graph.x
-        nt_cpu = self.tri_graph.node_type
+        N = self.tri_graph.x.size(0)
+        x_cpu = self.tri_graph.x.cpu()
+        nt_cpu = self.tri_graph.node_type.cpu()
+        node_text = getattr(self.tri_graph, "node_text", None)
         adj = self._local_adj
+
+        # Plan per-sample seeds.
+        per_sample_seeds: list[set[int]] = []
+        fallback_idx: list[int] = []
+        fallback_qs: list[torch.Tensor] = []
+        for i, s in enumerate(samples):
+            anchors = s.get("anchor_passage_nodes") or []
+            local_anchor_nodes = [int(nid) for (cid, nid) in anchors
+                                  if int(cid) == int(self.client_id) and 0 <= int(nid) < N]
+            if local_anchor_nodes:
+                per_sample_seeds.append(set(local_anchor_nodes))
+            else:
+                per_sample_seeds.append(set())
+                if s.get("q_emb") is not None:
+                    fallback_idx.append(i)
+                    fallback_qs.append(s["q_emb"])
+
+        # Fallback retrieval for samples without local anchors.
+        # Always computed on CPU — this is a one-time startup cost and the
+        # trigraph features are already in CPU memory. Avoids competing with
+        # the LLM for scarce VRAM when other processes are running.
+        if fallback_qs:
+            top_r = int(getattr(self.args, "retrieval_top_r", 16))
+            top_r = min(top_r, N)
+            x_norm = F.normalize(self.tri_graph.x.float().cpu(), dim=-1)
+            q_norm = F.normalize(torch.stack(fallback_qs).float(), dim=-1)
+            BLOCK = 256
+            topk_parts: list[torch.Tensor] = []
+            for start in range(0, q_norm.size(0), BLOCK):
+                q_block = q_norm[start : start + BLOCK]
+                scores = x_norm @ q_block.T          # [N, block] on CPU
+                topk_parts.append(torch.topk(scores, top_r, dim=0).indices.T)
+            topk_idx = torch.cat(topk_parts, dim=0)
+            for j, i in enumerate(fallback_idx):
+                per_sample_seeds[i] = set(topk_idx[j].tolist())
+
+        # CPU subgraph extraction (1-hop expand + edge filter)
         out = []
-        valid_iter = iter(topk_idx)
-        for sample, has in zip(samples, has_emb):
+        for sample, seed_set in zip(samples, per_sample_seeds):
             s = dict(sample)
-            if not has:
+            if not seed_set:
                 out.append(s)
                 continue
-            seeds = next(valid_iter)
-            seed_set = set(seeds.tolist())
-            nbrs: set[int] = set()
+            kept_set = set(seed_set)
             for seed in seed_set:
-                nbrs.update(adj[seed])
-            kept_set = seed_set | nbrs
+                kept_set.update(adj[seed])
             kept_list = sorted(kept_set)
             if not kept_list:
                 out.append(s)
@@ -298,23 +394,42 @@ class FedCondQAClient:
                 edge_weight=sub_ew,
                 node_type=nt_cpu[kept_t],
             )
+            if node_text is not None and isinstance(node_text, (list, tuple)) and len(node_text) == N:
+                graph.node_text = [node_text[i] for i in kept_list]
             s["graph"] = graph          # keep on CPU; model moves it during forward
             s["evidence_graph"] = graph
             out.append(s)
         return out
 
     def _attach_condensed_graphs(self, samples: list, retriever: GlobalGraphRetriever) -> list:
-        """Retrieve a condensed subgraph for each sample and attach it in-place."""
-        out = []
+        """Retrieve condensed subgraphs for all samples — one batched matmul."""
+        retriever_device = retriever._graph.x.device
+
+        # Collect mean-pool queries for samples that have a valid evidence graph
+        queries: list[torch.Tensor] = []
+        has_graph: list[bool] = []
         for sample in samples:
-            s = dict(sample)
-            graph = s.get("graph") or s.get("evidence_graph")
+            graph = sample.get("graph") or sample.get("evidence_graph")
             if graph is not None and graph.x.numel() > 0:
-                # Query must be on same device as retriever's synthetic graph
-                retriever_device = retriever._graph.x.device
-                query = graph.x.float().mean(0).to(retriever_device)
-                result = retriever.retrieve(query)
-                s["condensed_graph"] = result.data.cpu()
+                queries.append(graph.x.float().mean(0))
+                has_graph.append(True)
+            else:
+                has_graph.append(False)
+
+        if not queries:
+            return [dict(s) for s in samples]
+
+        # One [K,d]@[d,N] matmul instead of N sequential [K,d]@[d,1] matmuls
+        query_tensor = torch.stack(queries).to(retriever_device)     # [M, d]
+        results = retriever.retrieve_batch_queries(query_tensor)
+
+        out: list = []
+        result_idx = 0
+        for sample, has_g in zip(samples, has_graph):
+            s = dict(sample)
+            if has_g:
+                s["condensed_graph"] = results[result_idx].data.cpu()
+                result_idx += 1
             out.append(s)
         return out
 
@@ -348,7 +463,7 @@ class FedCondQAClient:
         return condensed
 
     def _stage_b_config(self) -> ClientCondensationConfig:
-        motif = MotifSelectorConfig(
+        motif = AnchorSelectorConfig(
             entity_ratio=float(getattr(self.args, "stage_b_entity_ratio", 0.05)),
             sentence_budget=int(getattr(self.args, "stage_b_sentence_budget", 3)),
             passage_budget=int(getattr(self.args, "stage_b_passage_budget", 3)),

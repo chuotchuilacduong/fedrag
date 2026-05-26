@@ -14,15 +14,15 @@ except Exception:  # pragma: no cover - fallback for import-only environments.
     Data = None
 
 from .graph_text_fusion import GraphTextFusion
-from .motif_core_selector import MotifSelection, MotifSelectorConfig, select_motif_core
+from .anchor_node_selector import AnchorSelection, AnchorSelectorConfig, select_anchor_nodes
 from .neighbor_gating import NodeEvidenceTrace, hierarchical_text_condensation
-from .text_bank import TextBank, build_text_bank
+from .node_text_embedder import NodeTextBank, build_text_bank
 from .topology_reconstruction import TopologyResult, knn_topology, self_expressive_topology
 
 
 @dataclass(frozen=True)
 class ClientCondensationConfig:
-    motif: MotifSelectorConfig = field(default_factory=MotifSelectorConfig)
+    motif: AnchorSelectorConfig = field(default_factory=AnchorSelectorConfig)
     text_budgets: tuple[int, int, int] = (1, 3, 2)
     chunk_budget: int = 8
     hop_weights: tuple[float, float, float] = (0.4, 0.4, 0.2)
@@ -66,7 +66,7 @@ class ClientCondensedGraph:
 class CondensationArtifacts:
     """Local-only artifacts that must not be uploaded."""
 
-    motif_selection: MotifSelection
+    motif_selection: AnchorSelection
     contexts: dict[int, Tensor]
     evidence_traces: dict[int, NodeEvidenceTrace]
     fusion_gate: Tensor
@@ -89,9 +89,9 @@ class ClientCondensor(nn.Module):
         self,
         tri_graph,
         *,
-        text_bank: TextBank,
+        text_bank: NodeTextBank,
         graph_embeddings: Tensor | None = None,
-        motif_selection: MotifSelection | None = None,
+        motif_selection: AnchorSelection | None = None,
         return_artifacts: bool = False,
     ):
         cfg = self.config
@@ -106,7 +106,7 @@ class ClientCondensor(nn.Module):
             for chunks in text_bank.chunk_embeddings
         ]
 
-        motif = motif_selection or select_motif_core(tri_graph, config=cfg.motif, x=graph_embeddings)
+        motif = motif_selection or select_anchor_nodes(tri_graph, config=cfg.motif, x=graph_embeddings)
         core_ids = motif.core_node_ids.to(device=graph_embeddings.device)
         core_graph_embeddings = graph_embeddings[core_ids]
         core_node_type = tri_graph.node_type[core_ids].long().to(device=graph_embeddings.device)
@@ -183,7 +183,7 @@ def condense_client_graph(
     tri_graph,
     *,
     node_texts: Sequence[str] | None = None,
-    text_bank: TextBank | None = None,
+    text_bank: NodeTextBank | None = None,
     graph_embeddings: Tensor | None = None,
     config: ClientCondensationConfig | None = None,
     return_artifacts: bool = False,

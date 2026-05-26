@@ -65,12 +65,39 @@ class FedTrainer:
         if os.environ.get("WANDB_API_KEY"):
             try:
                 import wandb
+                # Auto-generate a descriptive run name from dual_graph_mode when
+                # no explicit name is given, so ablations are easy to filter on WandB.
+                _mode = getattr(args, "dual_graph_mode", "both")
+                _auto_names = {
+                    "both": "dual-encoder",
+                    "dual": "dual-encoder",
+                    "shared": "ablation-shared-encoder",
+                    "no_synthetic": "ablation-no-synthetic",
+                    "evidence_only": "ablation-evidence-only",
+                    "condensed_only": "ablation-condensed-only",
+                    "none": "ablation-text-only",
+                    "text_only": "ablation-text-only",
+                }
+                _run_name = (getattr(args, "wandb_run_name", None)
+                             or _auto_names.get(_mode, f"mode-{_mode}"))
+                _tags = list(getattr(args, "wandb_tags", None) or [])
+                if _mode not in _tags:
+                    _tags.append(_mode)
+                _tags.append("fl-train")
                 self._wandb = wandb.init(
                     project=os.environ.get("WANDB_PROJECT", getattr(args, "wandb_project", "fedcond-graphrag")),
-                    name=getattr(args, "wandb_run_name", None),
+                    name=_run_name,
+                    group=getattr(args, "wandb_group", None),
+                    tags=_tags,
                     config=vars(args) if hasattr(args, "__dict__") else {},
                     resume="allow",
                 )
+                # Define two independent x-axes so round-level and step-level
+                # charts never share the same counter and WandB never drops data.
+                wandb.define_metric("comm_round")
+                wandb.define_metric("round/*", step_metric="comm_round")
+                wandb.define_metric("global_step")
+                wandb.define_metric("step/*", step_metric="global_step")
                 print(f"[wandb] run: {self._wandb.url}", flush=True)
             except Exception as exc:
                 print(f"[wandb] init failed, continuing without: {exc}", flush=True)
@@ -84,7 +111,19 @@ class FedTrainer:
         client_frac = float(getattr(self.args, "client_frac", 1.0))
         round_metrics: list[dict] = []
 
+        # Global step counter — monotone across all clients and rounds so the
+        # WandB x-axis is continuous and steps never go backwards.
+        global_step = 0
+
+        def _step_log(kv: dict, step: int) -> None:
+            if self._wandb is not None:
+                # Remap keys to step/* namespace and attach global_step x-axis
+                self._wandb.log(
+                    {"global_step": step, **{k.replace("train/", "step/"): v for k, v in kv.items()}},
+                )
+
         for round_id in range(num_rounds):
+            t_round_start = time.perf_counter()
             sampled = sorted(random.sample(
                 range(self.args.num_clients),
                 max(1, int(self.args.num_clients * client_frac)),
@@ -97,6 +136,7 @@ class FedTrainer:
             self.server.send_message()
 
             client_losses: dict[int, float] = {}
+            client_times: dict[int, float] = {}
             for cid in sampled:
                 t0 = time.perf_counter()
                 self.clients[cid].receive_message()
@@ -104,29 +144,41 @@ class FedTrainer:
 
                 loss = 0.0
                 if round_id >= 1 and self.shared_model is not None:
-                    loss = self.clients[cid].local_train()
+                    # Resample each round so the full pool is covered over many rounds
+                    if self._max_train_per_client > 0:
+                        self.clients[cid].sample_train_for_round(self._max_train_per_client)
+                    loss, steps = self.clients[cid].local_train(
+                        log_fn=_step_log, global_step_start=global_step
+                    )
+                    global_step += steps
                     client_losses[cid] = loss
 
                 self.clients[cid].send_message()
+                client_times[cid] = time.perf_counter() - t0
                 loss_str = f" | loss: {loss:.4f}" if round_id >= 1 else ""
-                print(f"    client_{cid}{loss_str} | {time.perf_counter() - t0:.1f}s", flush=True)
+                print(f"    client_{cid}{loss_str} | {client_times[cid]:.1f}s", flush=True)
 
             t0 = time.perf_counter()
             self.server.execute()
-            print(f"    server agg done in {time.perf_counter() - t0:.1f}s", flush=True)
+            agg_time = time.perf_counter() - t0
+            print(f"    server agg done in {agg_time:.1f}s", flush=True)
 
             train_acc = val_acc = test_acc = None
-            if round_id >= 1 and self.shared_model is not None:
-                if self._train_eval_samples:
-                    train_acc = self._eval_split_acc(self._train_eval_samples)
-                    print(f"    train acc : {train_acc:.1f}%", flush=True)
+            eval_time = None
+            eval_every = int(getattr(self.args, "eval_every", 1))
+            do_eval = round_id >= 1 and self.shared_model is not None and (round_id % eval_every == 0)
+            if do_eval:
+                t_eval = time.perf_counter()
                 if self._val_samples:
                     val_acc = self._eval_split_acc(self._val_samples)
                     print(f"    val   acc : {val_acc:.1f}%", flush=True)
                 if self._test_samples:
                     test_acc = self._eval_split_acc(self._test_samples)
                     print(f"    test  acc : {test_acc:.1f}%", flush=True)
+                eval_time = time.perf_counter() - t_eval
+                print(f"    eval done in {eval_time:.1f}s", flush=True)
 
+            round_time = time.perf_counter() - t_round_start
             avg_loss = (
                 sum(client_losses.values()) / len(client_losses) if client_losses else None
             )
@@ -134,12 +186,16 @@ class FedTrainer:
                 "round": round_id,
                 "avg_loss": avg_loss,
                 "client_losses": dict(client_losses),
+                "client_times": dict(client_times),
+                "round_time": round_time,
+                "agg_time": agg_time,
+                "eval_time": eval_time,
                 "train_acc": train_acc,
                 "val_acc": val_acc,
                 "test_acc": test_acc,
             }
             round_metrics.append(metrics)
-            self._log_metrics(metrics)
+            self._log_metrics(metrics, global_step=global_step)
 
         self._print_metrics_table(round_metrics)
 
@@ -152,7 +208,8 @@ class FedTrainer:
         from fedcond_grag.client.stage_d_retrieve.global_graph_retriever import GlobalGraphRetriever
         from fedcond_grag.utils.collate import collate_fn
 
-        batch_size = int(getattr(self.args, "local_batch_size", 4))
+        batch_size = int(getattr(self.args, "eval_batch_size",
+                                    getattr(self.args, "local_batch_size", 4)))
         top_r = int(getattr(self.args, "retrieval_top_r", 16))
         n_clients = len(self.clients)
         hits = 0
@@ -163,16 +220,15 @@ class FedTrainer:
                 shard = [s for i, s in enumerate(samples) if i % n_clients == cid]
                 if not shard:
                     continue
-                # Precompute evidence graphs for the whole shard in one GPU pass
                 shard = client._attach_evidence_graphs(shard)
                 syn_retriever = (
                     GlobalGraphRetriever(client.synthetic_graph, top_r=top_r)
                     if client.synthetic_graph is not None else None
                 )
+                if syn_retriever is not None:
+                    shard = client._attach_condensed_graphs(shard, syn_retriever)
                 for i in range(0, len(shard), batch_size):
                     mini = shard[i : i + batch_size]
-                    if syn_retriever is not None:
-                        mini = client._attach_condensed_graphs(mini, syn_retriever)
                     batch = collate_fn(mini)
                     out = self.shared_model.inference(batch)
                     for pred, label in zip(out["pred"], out["label"]):
@@ -181,22 +237,34 @@ class FedTrainer:
 
         return 100.0 * hits / max(len(samples), 1)
 
-    def _log_metrics(self, metrics: dict) -> None:
+    def _log_metrics(self, metrics: dict, global_step: int = 0) -> None:
         with self._metrics_path.open("a") as f:
-            f.write(json.dumps(metrics) + "\n")
-        if self._wandb is not None:
-            log = {"round": metrics["round"]}
-            if metrics["avg_loss"] is not None:
-                log["avg_loss"] = metrics["avg_loss"]
-                for cid, loss in metrics["client_losses"].items():
-                    log[f"client_{cid}_loss"] = loss
-            if metrics["train_acc"] is not None:
-                log["train_acc"] = metrics["train_acc"]
-            if metrics["val_acc"] is not None:
-                log["val_acc"] = metrics["val_acc"]
-            if metrics["test_acc"] is not None:
-                log["test_acc"] = metrics["test_acc"]
-            self._wandb.log(log, step=metrics["round"])
+            f.write(json.dumps({k: v for k, v in metrics.items()
+                                 if k not in ("client_times",)}) + "\n")
+        if self._wandb is None:
+            return
+        r = metrics["round"]
+        log: dict = {"comm_round": r}
+        # Loss per round
+        if metrics["avg_loss"] is not None:
+            log["round/avg_loss"] = metrics["avg_loss"]
+            for cid, loss in metrics["client_losses"].items():
+                log[f"round/client_{cid}_loss"] = loss
+        # Accuracy per round
+        if metrics["train_acc"] is not None:
+            log["round/train_acc"] = metrics["train_acc"]
+        if metrics["val_acc"] is not None:
+            log["round/val_acc"] = metrics["val_acc"]
+        if metrics["test_acc"] is not None:
+            log["round/test_acc"] = metrics["test_acc"]
+        # Timing
+        for cid, t in metrics.get("client_times", {}).items():
+            log[f"round/client_{cid}_time_s"] = t
+        if metrics.get("round_time") is not None:
+            log["round/total_time_s"] = metrics["round_time"]
+        if metrics.get("eval_time") is not None:
+            log["round/eval_time_s"] = metrics["eval_time"]
+        self._wandb.log(log)
 
     def _print_metrics_table(self, round_metrics: list[dict]) -> None:
         W = 95
@@ -260,11 +328,28 @@ class FedTrainer:
     def _init_stage_d(self) -> None:
         from fedcond_grag.dataloader import FedCondQADataset
         qa_root = getattr(self.args, "qa_data_root", "dataset/fedcond_qa")
+        top_r = int(getattr(self.args, "top_r_passages", 0))
+        top_r_anchor = getattr(self.args, "top_r_anchor", None)
+        if top_r_anchor is not None:
+            top_r_anchor = int(top_r_anchor)
         try:
-            qa_dataset = FedCondQADataset(root=qa_root)
+            qa_dataset = FedCondQADataset(
+                root=qa_root,
+                top_r_passages=top_r,
+                top_r_anchor=top_r_anchor,
+            )
         except FileNotFoundError as exc:
             print(f"[FedTrainer] Stage D disabled: QA dataset not found — {exc}")
             return
+        if top_r > 0:
+            if qa_dataset.top_r_passages == 0:
+                print(f"[FedTrainer] WARNING: --top-r-passages={top_r} requested but "
+                      f"passage_embs.pt / passage_node_map.pt not found in {qa_root} — "
+                      f"falling back to legacy desc.", flush=True)
+            else:
+                eff_anchor = qa_dataset.top_r_anchor
+                print(f"[FedTrainer] re-ranked desc enabled: top-{top_r} passages per sample, "
+                      f"graph anchored on top-{eff_anchor} of those.", flush=True)
 
         split_dir = Path(qa_root) / "split"
 
@@ -285,13 +370,18 @@ class FedTrainer:
 
         n = self.args.num_clients
         max_per = int(getattr(self.args, "max_train_per_client", 0))
+        self._max_train_per_client = max_per
         for cid, client in enumerate(self.clients):
             cid_indices = [i for i in train_idx if i % n == cid]
-            if max_per > 0:
-                cid_indices = cid_indices[:max_per]
-            samples = [qa_dataset[i] for i in cid_indices]
-            client.set_local_qa_data(samples)
-            print(f"    client_{cid}: {len(samples)} QA train samples")
+            all_samples = [qa_dataset[i] for i in cid_indices]
+            if max_per > 0 and max_per < len(all_samples):
+                # Pre-attach evidence graphs for ALL samples; each round will
+                # randomly pick max_per of them so the full dataset is covered.
+                client.set_full_train_pool(all_samples, max_per_round=max_per)
+            else:
+                client.set_local_qa_data(all_samples)
+                print(f"    client_{cid}: {len(all_samples)} QA train samples")
+
 
         try:
             from fedcond_grag.model import load_model, llama_model_path

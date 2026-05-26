@@ -9,10 +9,10 @@ class GCN(torch.nn.Module):
         self.convs = torch.nn.ModuleList()
         self.convs.append(GCNConv(in_channels, hidden_channels))
         self.bns = torch.nn.ModuleList()
-        self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
+        self.bns.append(torch.nn.LayerNorm(hidden_channels))
         for _ in range(num_layers - 2):
             self.convs.append(GCNConv(hidden_channels, hidden_channels))
-            self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
+            self.bns.append(torch.nn.LayerNorm(hidden_channels))
         self.convs.append(GCNConv(hidden_channels, out_channels))
         self.dropout = dropout
 
@@ -38,10 +38,10 @@ class GraphTransformer(torch.nn.Module):
         self.convs = torch.nn.ModuleList()
         self.convs.append(TransformerConv(in_channels=in_channels, out_channels=hidden_channels//num_heads, heads=num_heads, dropout=dropout))
         self.bns = torch.nn.ModuleList()
-        self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
+        self.bns.append(torch.nn.LayerNorm(hidden_channels))
         for _ in range(num_layers - 2):
             self.convs.append(TransformerConv(in_channels=hidden_channels, out_channels=hidden_channels//num_heads, heads=num_heads, dropout=dropout))
-            self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
+            self.bns.append(torch.nn.LayerNorm(hidden_channels))
         self.convs.append(TransformerConv(in_channels=hidden_channels, out_channels=out_channels//num_heads, heads=num_heads, dropout=dropout))
         self.dropout = dropout
 
@@ -66,10 +66,10 @@ class GAT(torch.nn.Module):
         self.convs = torch.nn.ModuleList()
         self.convs.append(GATConv(in_channels, hidden_channels, heads=num_heads, concat=False))
         self.bns = torch.nn.ModuleList()
-        self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
+        self.bns.append(torch.nn.LayerNorm(hidden_channels))
         for _ in range(num_layers - 2):
             self.convs.append(GATConv(hidden_channels, hidden_channels, heads=num_heads, concat=False))
-            self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
+            self.bns.append(torch.nn.LayerNorm(hidden_channels))
         self.convs.append(GATConv(hidden_channels, out_channels, heads=num_heads, concat=False))
         self.dropout = dropout
 

@@ -1,4 +1,4 @@
-"""Frozen local text-bank utilities for Stage B condensation."""
+"""Frozen local node text embedding utilities for Stage B condensation."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from torch import Tensor, nn
 
 
 @dataclass
-class TextBank:
+class NodeTextBank:
     """Local cache of node-level and chunk-level text embeddings."""
 
     node_embeddings: Tensor
@@ -105,7 +105,7 @@ def build_text_bank(
     max_chunk_tokens: int = 64,
     device: torch.device | None = None,
     batch_size: int = 4096,
-) -> TextBank:
+) -> NodeTextBank:
     """Build a frozen local text bank for all nodes — fully batched for speed."""
 
     encoder = encoder or load_frozen_encoder(encoder_name=encoder_name, dim=dim)
@@ -115,7 +115,7 @@ def build_text_bank(
 
     n = len(node_texts)
     if n == 0:
-        return TextBank(
+        return NodeTextBank(
             node_embeddings=torch.empty((0, dim), dtype=torch.float32),
             chunk_embeddings=[],
             encoder_name=encoder_name,
@@ -131,12 +131,13 @@ def build_text_bank(
         node_chunk_counts.append(len(chunks))
 
     # 2. Encode ALL chunks in large batches (single pass, GPU-efficient)
+    # Move each batch to CPU immediately to avoid accumulating on GPU
     all_embeddings_list: list[Tensor] = []
     for start in range(0, len(all_chunks), batch_size):
         batch = all_chunks[start : start + batch_size]
-        emb = encode_texts(encoder, batch, device=device)
+        emb = encode_texts(encoder, batch, device=device).cpu()
         all_embeddings_list.append(emb)
-    all_embeddings: Tensor = torch.cat(all_embeddings_list, dim=0)  # [total_chunks, d]
+    all_embeddings: Tensor = torch.cat(all_embeddings_list, dim=0)  # [total_chunks, d] on CPU
 
     # 3. Reassemble per-node chunk tensors and compute mean pooling
     chunk_embeddings: list[Tensor] = []
@@ -149,7 +150,7 @@ def build_text_bank(
         node_rows.append(node_embs.mean(dim=0))
 
     node_embeddings = torch.stack(node_rows, dim=0)
-    return TextBank(
+    return NodeTextBank(
         node_embeddings=node_embeddings,
         chunk_embeddings=chunk_embeddings,
         encoder_name=encoder_name,
@@ -157,7 +158,7 @@ def build_text_bank(
     )
 
 
-def save_text_bank(bank: TextBank, path: str | Path) -> None:
+def save_text_bank(bank: NodeTextBank, path: str | Path) -> None:
     """Save local-only text embeddings."""
 
     payload = {
@@ -169,11 +170,11 @@ def save_text_bank(bank: TextBank, path: str | Path) -> None:
     torch.save(payload, Path(path))
 
 
-def load_text_bank(path: str | Path, *, device: torch.device | None = None) -> TextBank:
-    """Load a local text-bank cache."""
+def load_text_bank(path: str | Path, *, device: torch.device | None = None) -> NodeTextBank:
+    """Load a local node text bank cache."""
 
     payload = torch.load(Path(path), map_location=device or "cpu")
-    return TextBank(
+    return NodeTextBank(
         node_embeddings=payload["node_embeddings"].to(device) if device is not None else payload["node_embeddings"],
         chunk_embeddings=[
             chunks.to(device) if device is not None else chunks for chunks in payload["chunk_embeddings"]

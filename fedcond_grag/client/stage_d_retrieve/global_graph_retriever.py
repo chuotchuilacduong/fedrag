@@ -117,6 +117,87 @@ class GlobalGraphRetriever:
         """
         return [self.retrieve(query_embeddings[i]) for i in range(query_embeddings.size(0))]
 
+    def retrieve_batch_queries(self, queries: Tensor) -> list[GlobalRetrievalResult]:
+        """Vectorized batch retrieval: one matmul for all queries.
+
+        Replaces N sequential [K,d]@[d,1] matmuls with a single [K,d]@[d,N]
+        matmul, then per-query 1-hop expansion and subgraph extraction.
+
+        Args:
+            queries: shape [N, d] — stacked query vectors (already on retriever device).
+
+        Returns:
+            List of N GlobalRetrievalResult, one per query.
+        """
+        if self._x_norm is None or queries.numel() == 0:
+            return [self.retrieve(queries[i]) for i in range(queries.size(0))]
+
+        from torch_geometric.utils import subgraph as pyg_subgraph
+
+        N = queries.size(0)
+        K = self._x_norm.size(0)
+        top_r = min(self._top_r, K)
+        dev = self._graph.x.device
+
+        q_norm = F.normalize(queries.float(), dim=-1)       # [N, d]
+        scores_all = self._x_norm @ q_norm.T               # [K, N] — one GPU matmul
+
+        # Top-r seeds per query: indices [top_r, N], scores [top_r, N]
+        topk_scores, topk_idx = torch.topk(scores_all, top_r, dim=0)
+
+        edge_index = self._graph.edge_index
+        edge_weight = getattr(self._graph, "edge_weight", None)
+        if edge_weight is None:
+            E = edge_index.size(1) if edge_index is not None and edge_index.numel() > 0 else 0
+            edge_weight = torch.ones(E, dtype=torch.float32, device=dev)
+
+        results: list[GlobalRetrievalResult] = []
+        for i in range(N):
+            seed_scores_vals = topk_scores[:, i]
+            seed_idx = topk_idx[:, i]
+            seed_set = set(seed_idx.tolist())
+
+            # 1-hop expansion via precomputed adjacency list
+            neighbor_set: set[int] = set()
+            for s in seed_set:
+                neighbor_set.update(self._adj[s])
+            kept_set = seed_set | neighbor_set
+
+            # Optional max_nodes clamping
+            if self._max_nodes is not None and len(kept_set) > self._max_nodes:
+                all_kept = torch.tensor(sorted(kept_set), dtype=torch.long, device=dev)
+                kept_scores = scores_all[all_kept, i]
+                _, top_idx = torch.topk(kept_scores, min(self._max_nodes, len(kept_set)))
+                kept_set = set(all_kept[top_idx].tolist())
+                new_seeds = [j for j in seed_idx.tolist() if j in kept_set]
+                seed_idx = torch.tensor(new_seeds, dtype=torch.long, device=dev)
+                seed_scores_vals = scores_all[seed_idx, i]
+
+            kept_indices = torch.tensor(sorted(kept_set), dtype=torch.long, device=dev)
+
+            if edge_index is not None and edge_index.numel() > 0:
+                sub_ei, sub_ew = pyg_subgraph(
+                    kept_indices, edge_index, edge_attr=edge_weight,
+                    relabel_nodes=True, num_nodes=K,
+                )
+            else:
+                sub_ei = torch.zeros(2, 0, dtype=torch.long, device=dev)
+                sub_ew = torch.zeros(0, device=dev)
+
+            out_data = Data(
+                x=self._graph.x[kept_indices],
+                edge_index=sub_ei,
+                edge_weight=sub_ew,
+                node_type=self._graph.node_type[kept_indices],
+            )
+            results.append(GlobalRetrievalResult(
+                data=out_data,
+                seed_indices=seed_idx,
+                kept_indices=kept_indices,
+                seed_scores=seed_scores_vals,
+            ))
+        return results
+
 
 def retrieve_global_subgraph(
     synthetic_graph: Data,

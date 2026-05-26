@@ -1,4 +1,4 @@
-"""Query-agnostic S-E-P motif selection for client condensation."""
+"""Query-agnostic S-E-P anchor node selection for client condensation."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ PASSAGE = 2
 
 
 @dataclass(frozen=True)
-class MotifSelectorConfig:
+class AnchorSelectorConfig:
     entity_ratio: float = 0.05
     sentence_budget: int = 3
     passage_budget: int = 3
@@ -27,10 +27,13 @@ class MotifSelectorConfig:
     min_entities: int = 1
     pagerank_iters: int = 20
     pagerank_damping: float = 0.85
+    # Cap entity pool before PageRank/MMR to handle very large graphs.
+    # 0 = no cap (original behaviour). Entities are sampled by degree before scoring.
+    max_entity_pool: int = 50_000
 
 
 @dataclass(frozen=True)
-class MotifSelection:
+class AnchorSelection:
     core_node_ids: Tensor
     core_edge_index: Tensor
     selected_motifs: list[tuple[int, list[int], list[int]]]
@@ -45,7 +48,7 @@ def _entity_pagerank_vectorized(
     entity_ids: Sequence[int],
     neighbors: Sequence[set[int]],
     node_type: Tensor,
-    cfg: MotifSelectorConfig,
+    cfg: AnchorSelectorConfig,
     *,
     _node_type_list: list[int] | None = None,
 ) -> dict[int, float]:
@@ -110,7 +113,7 @@ def _score_entities_vectorized(
     data,
     entity_ids: Sequence[int],
     neighbors: Sequence[set[int]],
-    cfg: MotifSelectorConfig,
+    cfg: AnchorSelectorConfig,
 ) -> dict[int, float]:
     """Vectorized entity scoring using degree counts and PageRank."""
 
@@ -153,7 +156,7 @@ def _mmr_select_vectorized(
     scores: dict[int, float],
     x: Tensor | None,
     k: int,
-    cfg: MotifSelectorConfig,
+    cfg: AnchorSelectorConfig,
 ) -> list[int]:
     """Vectorized MMR selection — O(K × N) tensor ops instead of O(K × N) Python loops."""
 
@@ -271,14 +274,14 @@ def _induced_sep_edges(edge_index: Tensor, core_ids: Sequence[int], node_type: T
     return edge_tensor, mapping
 
 
-def select_motif_core(data, config: MotifSelectorConfig | None = None, x: Tensor | None = None) -> MotifSelection:
-    """Select entity-anchored S-E-P motifs and return a remapped core graph."""
+def select_anchor_nodes(data, config: AnchorSelectorConfig | None = None, x: Tensor | None = None) -> AnchorSelection:
+    """Select entity-anchored S-E-P nodes and return a remapped core graph."""
 
     from fedcond_grag.client.stage_b_condense.neighbor_gating import build_undirected_neighbors
 
-    cfg = config or MotifSelectorConfig()
+    cfg = config or AnchorSelectorConfig()
     if not hasattr(data, "node_type"):
-        raise ValueError("data.node_type is required for S-E-P motif selection")
+        raise ValueError("data.node_type is required for S-E-P anchor node selection")
     node_type = data.node_type.detach().cpu().long()
     x = x if x is not None else getattr(data, "x", None)
     if x is not None:
@@ -286,8 +289,22 @@ def select_motif_core(data, config: MotifSelectorConfig | None = None, x: Tensor
 
     entity_ids = _typed_nodes(node_type, ENTITY)
     if not entity_ids:
-        raise ValueError("Tri-Graph contains no entity nodes; cannot select S-E-P motifs")
+        raise ValueError("Tri-Graph contains no entity nodes; cannot select S-E-P anchor nodes")
     neighbors = build_undirected_neighbors(data.edge_index, int(node_type.numel()))
+
+    # Subsample large entity pools by degree (high-degree entities first) so
+    # PageRank/MMR stays tractable on full-scale datasets.
+    if cfg.max_entity_pool > 0 and len(entity_ids) > cfg.max_entity_pool:
+        import random
+        # Sort by degree descending, keep top half by degree + random sample the rest
+        half = cfg.max_entity_pool // 2
+        by_deg = sorted(entity_ids, key=lambda e: len(neighbors[e]), reverse=True)
+        top_deg = by_deg[:half]
+        rest = by_deg[half:]
+        random.shuffle(rest)
+        entity_ids = top_deg + rest[: cfg.max_entity_pool - half]
+        print(f"    [B] Entity pool capped: {len(entity_ids)} / {(node_type == 0).sum().item()} entities used for anchor scoring")
+
     scores = _score_entities_vectorized(data, entity_ids, neighbors, cfg)
     k_entities = max(int(cfg.min_entities), int(ceil(cfg.entity_ratio * len(entity_ids))))
     selected_entities = _mmr_select_vectorized(entity_ids, scores, x, min(k_entities, len(entity_ids)), cfg)
@@ -308,7 +325,7 @@ def select_motif_core(data, config: MotifSelectorConfig | None = None, x: Tensor
     deduped = list(dict.fromkeys(int(node_id) for node_id in selected_core))
     core_edge_index, mapping = _induced_sep_edges(data.edge_index, deduped, node_type)
     core_node_ids = torch.tensor(deduped, dtype=torch.long, device=data.edge_index.device)
-    return MotifSelection(
+    return AnchorSelection(
         core_node_ids=core_node_ids,
         core_edge_index=core_edge_index,
         selected_motifs=motifs,
