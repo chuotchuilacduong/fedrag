@@ -11,11 +11,40 @@ from peft import (
     prepare_model_for_kbit_training,
 )
 
+# Legacy Llama-2 chat markers — used only when the tokenizer is Llama-family.
+# Other models get their native template via resolve_prompt_template().
 BOS = '<s>[INST]'
 EOS_USER = '[/INST]'
 EOS = '</s>'
 
 IGNORE_INDEX = -100
+
+
+def resolve_prompt_template(tokenizer) -> tuple[str, str, str]:
+    """Pick prompt markers native to the tokenizer's model family.
+
+    Returns (bos_text, eos_user_text, eos_text). Training labels end with
+    eos_text, so it must be the tokenizer's real EOS: with a frozen LLM the
+    model can only stop generation through tokens it already knows. Hardcoded
+    Llama markers fed to a Qwen tokenizer become literal text — the model then
+    emits the string "</s>" instead of stopping.
+    """
+    if "<|im_start|>" in tokenizer.get_vocab():  # Qwen family
+        if tokenizer.eos_token == "<|im_end|>":  # instruct-tuned → ChatML-aligned
+            return (
+                "<|im_start|>user\n",
+                "<|im_end|>\n<|im_start|>assistant\n",
+                "<|im_end|>",
+            )
+        # Base Qwen (eos <|endoftext|>): not ChatML-aligned — ChatML markers make
+        # it echo the input instead of answering. Plain QA format works:
+        # verified "desc\nquestion\nAnswer:" → correct answer on Qwen2.5-1.5B.
+        return ("", "\nAnswer:", tokenizer.eos_token or "<|endoftext|>")
+    if tokenizer.bos_token == "<s>":  # Llama family — original G-Retriever format
+        return (BOS, EOS_USER, EOS)
+    bos = tokenizer.bos_token or ""
+    eos = tokenizer.eos_token or ""
+    return (bos, "\nAnswer:", eos)
 
 
 class GraphLLM(torch.nn.Module):
@@ -45,6 +74,8 @@ class GraphLLM(torch.nn.Module):
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.tokenizer.padding_side = 'left'
+        self.bos_text, self.eos_user_text, self.eos_text = resolve_prompt_template(self.tokenizer)
+        print(f"Prompt template: bos={self.bos_text!r} eos_user={self.eos_user_text!r} eos={self.eos_text!r}")
 
         load_in_8bit = bool(getattr(args, "llm_load_in_8bit", False))
         load_in_4bit = bool(getattr(args, "llm_load_in_4bit", False))
@@ -105,6 +136,13 @@ class GraphLLM(torch.nn.Module):
 
         self.model = model
 
+        # Propagate hf_device_map from the inner LLM to the wrapper so that
+        # FedTrainer's "if not hasattr(model, 'hf_device_map'): model.to(cpu)"
+        # guard also applies here — otherwise it would move graph_encoder to CPU
+        # while word_embedding (a reference into the quantized LLM) stays on CUDA.
+        if hasattr(model, "hf_device_map"):
+            self.hf_device_map = model.hf_device_map
+
         if getattr(args, "llm_gradient_checkpointing", False):
             self.model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -115,6 +153,13 @@ class GraphLLM(torch.nn.Module):
 
         llm_hidden_size = self.model.config.hidden_size
 
+        # word_embedding (nn.Embedding) is never quantized by bitsandbytes, so its
+        # weight always lives on the true device — use it as the authoritative
+        # device probe instead of self.model.device / next(model.parameters()),
+        # both of which return 'cpu' for Params4bit objects in some bnb versions.
+        self.word_embedding = self.model.model.get_input_embeddings()
+        _true_device = self.word_embedding.weight.device
+
         _gnn_dtype = torch.bfloat16
         self.graph_encoder = load_gnn_model[args.gnn_model_name](
             in_channels=args.gnn_in_dim,
@@ -123,21 +168,19 @@ class GraphLLM(torch.nn.Module):
             num_layers=args.gnn_num_layers,
             dropout=args.gnn_dropout,
             num_heads=args.gnn_num_heads,
-        ).to(dtype=_gnn_dtype, device=self.model.device)
+        ).to(dtype=_gnn_dtype, device=_true_device)
 
         self.projector = nn.Sequential(
             nn.Linear(args.gnn_hidden_dim, 2048),
             nn.GELU(),
             nn.Linear(2048, llm_hidden_size),
-        ).to(dtype=_gnn_dtype, device=self.model.device)
-
-        self.word_embedding = self.model.model.get_input_embeddings()
+        ).to(dtype=_gnn_dtype, device=_true_device)
 
         # Cache device + special-token embeddings so we don't iterate all
         # parameters or rebuild bos/pad embeddings on every forward pass.
-        self._device_cache = next(self.model.parameters()).device
+        self._device_cache = _true_device
         with torch.no_grad():
-            bos_ids = self.tokenizer(BOS, add_special_tokens=False, return_tensors='pt').input_ids[0]
+            bos_ids = self.tokenizer(self.bos_text, add_special_tokens=False, return_tensors='pt').input_ids[0]
             self._bos_embeds_cached = self.word_embedding(bos_ids.to(self._device_cache)).detach()
             pad_id = torch.tensor(self.tokenizer.pad_token_id, device=self._device_cache)
             self._pad_embed_cached = self.word_embedding(pad_id).detach().unsqueeze(0)
@@ -158,7 +201,7 @@ class GraphLLM(torch.nn.Module):
 
     def encode_graphs(self, samples):
         graphs = samples['graph']
-        graphs = graphs.to(self.model.device)
+        graphs = graphs.to(next(self.graph_encoder.parameters()).device)
         _dtype = next(self.graph_encoder.parameters()).dtype
         x = graphs.x.to(_dtype)
         edge_attr = graphs.edge_attr.to(_dtype) if graphs.edge_attr is not None else None
@@ -178,8 +221,8 @@ class GraphLLM(torch.nn.Module):
 
         # encode special tokens — eos/eos_user tokens are still cheap; bos/pad
         # embeds are cached buffers built once in __init__.
-        eos_tokens = self.tokenizer(EOS, add_special_tokens=False)
-        eos_user_tokens = self.tokenizer(EOS_USER, add_special_tokens=False)
+        eos_tokens = self.tokenizer(self.eos_text, add_special_tokens=False)
+        eos_user_tokens = self.tokenizer(self.eos_user_text, add_special_tokens=False)
         bos_embeds = self._bos_embeds_cached
         pad_embeds = self._pad_embed_cached
 
@@ -260,7 +303,7 @@ class GraphLLM(torch.nn.Module):
         descriptions = self.tokenizer(samples["desc"], add_special_tokens=False)
 
         # encode special tokens — use cached bos/pad embeds.
-        eos_user_tokens = self.tokenizer(EOS_USER, add_special_tokens=False)
+        eos_user_tokens = self.tokenizer(self.eos_user_text, add_special_tokens=False)
         bos_embeds = self._bos_embeds_cached
         pad_embeds = self._pad_embed_cached
 

@@ -55,7 +55,6 @@ def select_chunks(
     candidate_node_ids: Sequence[int],
     chunk_bank: Sequence[Tensor],
     *,
-    scorer: nn.Module | None = None,
     budget: int = 8,
 ) -> tuple[Tensor, ChunkSelection]:
     """Select up to ``budget`` chunks and return ``t_tilde_v`` plus trace.
@@ -79,14 +78,14 @@ def select_chunks(
             flat_chunk_ids.append(chunk_id)
 
     if not flat_chunks:
-        dim = g_v.numel() if scorer is None else scorer(g_v).numel()
+        dim = g_v.numel()
         empty = g_v.new_zeros((dim,))
         trace = ChunkSelection(node_ids=[], chunk_ids=[], weights=g_v.new_zeros((0,)))
         return empty, trace
 
     chunks_tensor = torch.stack(flat_chunks, dim=0).to(device=g_v.device, dtype=g_v.dtype)
-    scores = score_chunks(g_v, chunks_tensor, scorer=scorer)
-    weights = topk_softmax(scores, k=budget)
+    scores = score_chunks(g_v, chunks_tensor)
+    weights = topk_softmax(scores, int(budget))
     selected = weights > 0
 
     if selected.any():

@@ -48,19 +48,8 @@ class FedCondQADataset(Dataset):
         else:
             self.q_embs = None
 
-        # Optional passage-level artefacts for ranked retrieval + graph anchoring.
-        self.passage_embs: torch.Tensor | None = None
-        self.passage_node_map: torch.Tensor | None = None
-        if self.top_r_passages > 0:
-            emb_p = self.root / "passage_embs.pt"
-            map_p = self.root / "passage_node_map.pt"
-            if emb_p.exists():
-                self.passage_embs = torch.load(emb_p, map_location="cpu", weights_only=True).float()
-            if map_p.exists():
-                self.passage_node_map = torch.load(map_p, map_location="cpu", weights_only=True)
-            if self.passage_embs is None or self.q_embs is None:
-                # If we cannot re-rank, fall back silently to legacy desc.
-                self.top_r_passages = 0
+        # Per-client PPR node maps are loaded by FedCondQAClient directly from
+        # processed/{dataset}/client_{c}/ppr_node_map.pt — not by this dataset.
 
     def __len__(self) -> int:
         return len(self.records)
@@ -74,39 +63,16 @@ class FedCondQADataset(Dataset):
             answer = "|".join(str(item) for item in answer)
 
         passages = record.get("retrieved_passages", []) or []
-        anchor_nodes: list[tuple[int, int]] = []
 
-        if self.top_r_passages > 0 and self.q_embs is not None and self.passage_embs is not None:
-            r = min(self.top_r_passages, len(passages))
-            # cos-sim over the (≤10) passages of this record
-            qv = self.q_embs[index].float()
-            pv = self.passage_embs[index][:len(passages)].float()
-            q_n = qv / (qv.norm() + 1e-8)
-            p_n = pv / (pv.norm(dim=-1, keepdim=True) + 1e-8)
-            scores = (p_n @ q_n)                       # [n_p]
-            order = scores.argsort(descending=True).tolist()
-            top = order[:r]
-            ranked_passages = [str(passages[i]) for i in top]
-            desc = "\n\n".join(ranked_passages)
-            if self.passage_node_map is not None:
-                pm = self.passage_node_map[index]      # [10, 2]
-                # Only the top `top_r_anchor` re-ranked passages become graph
-                # anchors, regardless of how many we used for desc.
-                anchor_top = top[: max(1, self.top_r_anchor)]
-                for i in anchor_top:
-                    cid, nid = int(pm[i, 0]), int(pm[i, 1])
-                    if cid >= 0 and nid >= 0:
-                        anchor_nodes.append((cid, nid))
-        else:
-            desc = self._load_description(record_id, record)
+        desc = self._load_description(record_id, record)
 
         item: dict = {
+            "idx": index,          # dataset integer index — used by client to look up ppr_node_map
             "id": record_id,
             "question": f"Question: {question_text}\nAnswer: ",
             "label": str(answer).lower(),
             "desc": desc,
             "retrieved_passages": passages,
-            "anchor_passage_nodes": anchor_nodes,
         }
         if self.q_embs is not None:
             item["q_emb"] = self.q_embs[index]   # [384] — used for on-the-fly retrieval
@@ -150,10 +116,15 @@ class FedCondQADataset(Dataset):
         desc_path = self.root / "cached_desc" / f"{record_id}.txt"
         if desc_path.exists():
             return desc_path.read_text(encoding="utf-8")
+        # Prefer the pre-built desc (clean MuSiQue evidence paragraphs) over
+        # retrieved_passages, which is a noisy 20-passage BM25 dump full of distractors.
+        desc = str(record.get("desc", "")).strip()
+        if desc:
+            return desc
         passages = record.get("retrieved_passages", [])
         if passages:
             return "\n\nRetrieved passages:\n" + "\n".join(str(p) for p in passages)
-        return str(record.get("desc", ""))
+        return ""
 
     def _read_indices(self, path: Path) -> list[int]:
         with path.open("r", encoding="utf-8") as handle:

@@ -28,8 +28,9 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from fedcond_grag.dataloader.federated_partition import chunk_partition_stats, partition_linearrag_chunks
-from fedcond_grag.dataloader.linearrag_loader import (
+from fedcond_grag.dataloader.data_preprocess import (
+    chunk_partition_stats,
+    partition_linearrag_chunks,
     load_linearrag_dataset,
     save_chunk_list,
     save_question_list,

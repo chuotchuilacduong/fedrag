@@ -18,4 +18,13 @@ config = {
     "match_norm_weight": 0.0,
     "condense_refresh_every": 10,
     "preserve_sep_topology": True,
+    # Stage C mode: "gradient_match" | "repr_align" | "both"
+    "server_stage_c_mode": "gradient_match",
+    "repr_align_weight": 1.0,
+    "grad_match_weight": 1.0,
+    "lambda_div": 0.1,
+    "lambda_deg": 0.05,
+    "repr_proj_out_dim": 4096,
+    "gnn_model_name": "gcn",
+    "gnn_model_name_c": "gcn",
 }

@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch_scatter import scatter
 
 from fedcond_grag.model.gnn import load_gnn_model
-from fedcond_grag.model.graph_llm import BOS, EOS, EOS_USER, IGNORE_INDEX, GraphLLM
+from fedcond_grag.model.graph_llm import IGNORE_INDEX, GraphLLM
 
 
 class DualGraphLLM(GraphLLM):
@@ -12,7 +12,7 @@ class DualGraphLLM(GraphLLM):
     def __init__(self, args, **kwargs):
         super().__init__(args, **kwargs)
 
-        self.dual_graph_mode = getattr(args, "dual_graph_mode", "both")
+        self.dual_graph_mode = getattr(args, "dual_graph_mode", "shared")
 
         if self.dual_graph_mode in ("shared", "no_synthetic"):
             # shared: one GNN encoder for both graphs.
@@ -41,13 +41,13 @@ class DualGraphLLM(GraphLLM):
                 num_layers=gnn_num_layers_c,
                 dropout=args.gnn_dropout,
                 num_heads=gnn_num_heads_c,
-            ).to(dtype=_gnn_dtype, device=self.model.device)
+            ).to(dtype=_gnn_dtype, device=self._device_cache)
 
             self.projector_c = nn.Sequential(
                 nn.Linear(gnn_hidden_dim_c, 2048),
                 nn.GELU(),
                 nn.Linear(2048, prompt_dim),
-            ).to(dtype=_gnn_dtype, device=self.model.device)
+            ).to(dtype=_gnn_dtype, device=self._device_cache)
 
     def _graph_edge_attr(self, graph):
         return getattr(graph, "edge_attr", None)
@@ -58,8 +58,9 @@ class DualGraphLLM(GraphLLM):
         return torch.zeros(graph.x.size(0), dtype=torch.long, device=graph.x.device)
 
     def _encode_one_graph(self, graph, encoder, projector):
-        graph = graph.to(self.model.device)
         _param = next(encoder.parameters(), None)
+        enc_device = _param.device if _param is not None else graph.x.device
+        graph = graph.to(enc_device)
         dtype = _param.dtype if _param is not None else graph.x.dtype
         x = graph.x.to(dtype)
         edge_attr = self._graph_edge_attr(graph)
@@ -120,14 +121,14 @@ class DualGraphLLM(GraphLLM):
         descriptions = self.tokenizer(samples["desc"], add_special_tokens=False)
         labels = self.tokenizer(samples["label"], add_special_tokens=False)
 
-        eos_tokens = self.tokenizer(EOS, add_special_tokens=False)
-        eos_user_tokens = self.tokenizer(EOS_USER, add_special_tokens=False)
+        eos_tokens = self.tokenizer(self.eos_text, add_special_tokens=False)
+        eos_user_tokens = self.tokenizer(self.eos_user_text, add_special_tokens=False)
         bos_embeds, pad_embeds = self._special_embeds()
 
         z_e, z_c = self.encode_graphs(samples)
 
         batch_size = len(samples["id"])
-        dev = self.model.device
+        dev = self._device_cache
 
         # Collect all token-id sequences before touching the GPU so we can
         # embed the entire batch in one call instead of batch_size separate calls.
@@ -200,13 +201,13 @@ class DualGraphLLM(GraphLLM):
         questions = self.tokenizer(samples["question"], add_special_tokens=False)
         descriptions = self.tokenizer(samples["desc"], add_special_tokens=False)
 
-        eos_user_tokens = self.tokenizer(EOS_USER, add_special_tokens=False)
+        eos_user_tokens = self.tokenizer(self.eos_user_text, add_special_tokens=False)
         bos_embeds, pad_embeds = self._special_embeds()
 
         z_e, z_c = self.encode_graphs(samples)
 
         batch_size = len(samples["id"])
-        dev = self.model.device
+        dev = self._device_cache
 
         # Collect token ids; embed in one batched call.
         all_text_ids: list[list[int]] = []
@@ -256,6 +257,7 @@ class DualGraphLLM(GraphLLM):
                 use_cache=True,
             )
         pred = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        pred = [p.strip() for p in pred]
 
         return {
             "id": samples["id"],

@@ -38,7 +38,7 @@ from fedcond_grag.client.stage_b_condense import (
     load_text_bank,
     save_text_bank,
 )
-from fedcond_grag.client.stage_b_condense.text_bank import load_frozen_encoder
+from fedcond_grag.client.stage_b_condense.node_text_embedder import load_frozen_encoder
 from fedcond_grag.server.server import FedCondQAServer
 
 PROCESSED_ROOT = _ROOT / "processed"
@@ -111,12 +111,12 @@ def build_condensed(client_dir: Path, graph: Data, force: bool, topology_method:
         save_text_bank(bank, bank_path)
         print(f"    [B] Text bank built in {time.time()-t:.0f}s")
 
-    from fedcond_grag.client.stage_b_condense.motif_core_selector import MotifSelectorConfig
+    from fedcond_grag.client.stage_b_condense.anchor_node_selector import AnchorSelectorConfig
     n_ent = int((graph.node_type == 0).sum().item())
     k_ent = max(1, int(entity_ratio * n_ent))
     print(f"    [B] Running client condensation ({topology_method} topology, entity_ratio={entity_ratio:.3f}, core_entities={k_ent}/{n_ent})...")
     t = time.time()
-    motif_cfg = MotifSelectorConfig(entity_ratio=entity_ratio)
+    motif_cfg = AnchorSelectorConfig(entity_ratio=entity_ratio)
     cfg = ClientCondensationConfig(topology_method=topology_method, knn_k=8, motif=motif_cfg)
     condensed, _ = condense_client_graph(
         graph,

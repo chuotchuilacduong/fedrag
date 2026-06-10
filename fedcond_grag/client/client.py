@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import random
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -49,13 +50,33 @@ class FedCondQAClient:
         self._model_weights: dict | None = None   # per-client GNN/proj state dicts
         self._num_local_samples: int = 0
         self._local_adj: list | None = None    # CPU adjacency lists for trigraph
+        # Per-client PPR node map: [Q, top_k] int64 — local trigraph node IDs
+        # for each question's PPR-selected passages. Loaded from
+        # processed/{dataset}/client_{c}/ppr_node_map.pt.
+        self._ppr_node_map: "torch.Tensor | None" = self._load_ppr_node_map()
         # AdamW persisted across rounds — Adam's v_t needs many steps to warm
         # up; rebuilding it every round (the old behaviour) kept it permanently
         # cold and effective LR ≈ 0.
         self._optimizer: torch.optim.Optimizer | None = None
-        # Full pool of pre-attached train samples (evidence graphs attached once
-        # at startup). Each round we randomly sample max_per from this pool.
+        # Raw (un-attached) train sample pool. Evidence graphs are attached
+        # lazily in sample_train_for_round so startup cost is O(1) regardless
+        # of pool size. Only the per-round subset is ever built at once.
         self._train_pool: list = []
+        self._train_pool_max_per_round: int = 0
+
+    def _load_ppr_node_map(self) -> "torch.Tensor | None":
+        """Load this client's per-query PPR node map if available."""
+        data_root = getattr(self.args, "data_root", "processed")
+        dataset = getattr(self.args, "dataset", "")
+        if isinstance(dataset, (list, tuple)):  # GFL-style configs pass a list
+            dataset = dataset[0] if dataset else ""
+        path = str(Path(data_root) / str(dataset))
+        map_path = Path(path) / f"client_{self.client_id}" / "ppr_node_map.pt"
+        if map_path.exists():
+            m = torch.load(map_path, map_location="cpu", weights_only=True)
+            print(f"    [client_{self.client_id}] Loaded ppr_node_map.pt {tuple(m.shape)}")
+            return m
+        return None
 
     # ------------------------------------------------------------------
     # Setup helpers (called by FedTrainer)
@@ -67,29 +88,28 @@ class FedCondQAClient:
         self._num_local_samples = len(samples)
 
     def set_full_train_pool(self, samples: list, max_per_round: int | None = None) -> None:
-        """Pre-attach evidence graphs for all train samples (done once at startup).
+        """Store raw samples for lazy per-round evidence graph attachment.
 
-        Each round, call sample_train_for_round(n) to pick a fresh random
-        subset so all samples are covered over many FL rounds.
+        Evidence graphs are NOT built here — they are built in
+        sample_train_for_round so the cost is O(max_per_round) per round,
+        not O(len(samples)) at startup.
         """
-        print(f"    client_{self.client_id}: attaching evidence graphs for "
-              f"{len(samples)} train samples (one-time startup cost)...", flush=True)
-        self._train_pool = self._attach_evidence_graphs(samples)
-        n = max_per_round if max_per_round and max_per_round < len(self._train_pool) else len(self._train_pool)
+        self._train_pool = samples  # raw records, no graph attached yet
+        n = max_per_round if max_per_round and max_per_round < len(samples) else len(samples)
+        self._train_pool_max_per_round = n
         self._num_local_samples = n
-        self.sample_train_for_round(n)
         print(f"    client_{self.client_id}: pool={len(self._train_pool)}, "
-              f"per-round budget={n}", flush=True)
+              f"per-round budget={n} (evidence graphs built per-round)", flush=True)
+        self.sample_train_for_round(n)
 
     def sample_train_for_round(self, n: int | None = None) -> None:
-        """Pick a fresh random subset of n samples from the full train pool."""
+        """Pick a fresh random subset — evidence graphs are built per mini-batch in local_train."""
         if not self._train_pool:
             return
+        n_actual = n if n is not None else self._train_pool_max_per_round
         pool = self._train_pool
-        if n is None or n >= len(pool):
-            self.local_qa_samples = list(pool)
-        else:
-            self.local_qa_samples = random.sample(pool, n)
+        subset = list(pool) if (n_actual is None or n_actual >= len(pool)) else random.sample(pool, n_actual)
+        self.local_qa_samples = subset  # raw samples; no graph attached yet
         self._num_local_samples = len(self.local_qa_samples)
 
     def set_shared_model(self, model: "DualGraphLLM") -> None:
@@ -187,16 +207,7 @@ class FedCondQAClient:
         batch_size = int(getattr(self.args, "local_batch_size", 4))
         grad_clip = float(getattr(self.args, "local_grad_clip", 1.0))
 
-        # Pre-attach condensed graphs ONCE per round — within a round the
-        # synthetic graph is fixed and per-sample retrieval results don't
-        # change between epochs/batches. Calling it per mini-batch (the old
-        # behaviour) ran the same retrieval `epochs * ceil(N/bs)` times.
-        if retriever is not None:
-            base_samples = self._attach_condensed_graphs(
-                list(self.local_qa_samples), retriever
-            )
-        else:
-            base_samples = list(self.local_qa_samples)
+        base_samples = list(self.local_qa_samples)  # raw samples, no graph attached
 
         self.shared_model.train()
         total_loss = 0.0
@@ -210,6 +221,11 @@ class FedCondQAClient:
             random.shuffle(samples)
             for i in range(0, len(samples), batch_size):
                 mini = samples[i : i + batch_size]
+                # Evidence graph built per query — PPR anchors → 1-hop subgraph + desc
+                mini = self._attach_evidence_graphs(mini)
+                # Condensed graph retrieved per batch — synthetic graph is fixed within a round
+                if retriever is not None:
+                    mini = self._attach_condensed_graphs(mini, retriever)
                 batch = collate_fn(mini)
                 optimizer.zero_grad()
                 loss = self.shared_model(batch)
@@ -286,20 +302,14 @@ class FedCondQAClient:
             self.shared_model.projector_c.load_state_dict(self._model_weights["projector_c"])
 
     def _attach_evidence_graphs(self, samples: list) -> list:
-        """Build per-sample evidence subgraphs anchored on top-r passage nodes.
+        """Build per-sample evidence subgraphs from per-query PPR anchor nodes.
 
-        Two seed sources (used independently per sample, anchor-first):
-          1. Anchor nodes — sample["anchor_passage_nodes"] is a list of
-             (client_id, node_id) for the top-r question-relevant passages.
-             We keep only those whose client_id == self.client_id (i.e., live
-             on this client's trigraph).
-          2. Fallback — if no anchor nodes are local, fall back to the legacy
-             q_emb-vs-trigraph top-r retrieval so the graph path still works.
+        anchor_passage_nodes (from passage_node_map.pt) are the PPR-selected
+        passage trigraph nodes for this query. We filter to the local client's
+        nodes, use them as 1-hop expansion seeds for the evidence graph, and
+        cosine-rerank them to produce the LLM text desc.
 
-        From the seed set we do 1-hop expansion in the local trigraph and
-        return a CPU Data with x / edge_index / edge_weight / node_type /
-        node_text preserved. node_text is needed downstream for any future
-        text injection of retrieved nodes.
+        Raises RuntimeError if passage_node_map.pt was not generated first.
         """
         import torch.nn.functional as F
         from torch_geometric.data import Data as _Data
@@ -323,56 +333,45 @@ class FedCondQAClient:
         nt_cpu = self.tri_graph.node_type.cpu()
         node_text = getattr(self.tri_graph, "node_text", None)
         adj = self._local_adj
+        top_k_desc = max(1, int(getattr(self.args, "top_r_anchor", None) or 5))
 
-        # Plan per-sample seeds.
-        per_sample_seeds: list[set[int]] = []
-        fallback_idx: list[int] = []
-        fallback_qs: list[torch.Tensor] = []
-        for i, s in enumerate(samples):
-            anchors = s.get("anchor_passage_nodes") or []
-            local_anchor_nodes = [int(nid) for (cid, nid) in anchors
-                                  if int(cid) == int(self.client_id) and 0 <= int(nid) < N]
-            if local_anchor_nodes:
-                per_sample_seeds.append(set(local_anchor_nodes))
-            else:
-                per_sample_seeds.append(set())
-                if s.get("q_emb") is not None:
-                    fallback_idx.append(i)
-                    fallback_qs.append(s["q_emb"])
+        if self._ppr_node_map is None:
+            raise RuntimeError(
+                f"[client_{self.client_id}] ppr_node_map.pt not found. "
+                "Run scripts/preprocess_fedcond_qa.py --dataset <dataset> first."
+            )
 
-        # Fallback retrieval for samples without local anchors.
-        # Always computed on CPU — this is a one-time startup cost and the
-        # trigraph features are already in CPU memory. Avoids competing with
-        # the LLM for scarce VRAM when other processes are running.
-        if fallback_qs:
-            top_r = int(getattr(self.args, "retrieval_top_r", 16))
-            top_r = min(top_r, N)
-            x_norm = F.normalize(self.tri_graph.x.float().cpu(), dim=-1)
-            q_norm = F.normalize(torch.stack(fallback_qs).float(), dim=-1)
-            BLOCK = 256
-            topk_parts: list[torch.Tensor] = []
-            for start in range(0, q_norm.size(0), BLOCK):
-                q_block = q_norm[start : start + BLOCK]
-                scores = x_norm @ q_block.T          # [N, block] on CPU
-                topk_parts.append(torch.topk(scores, top_r, dim=0).indices.T)
-            topk_idx = torch.cat(topk_parts, dim=0)
-            for j, i in enumerate(fallback_idx):
-                per_sample_seeds[i] = set(topk_idx[j].tolist())
+        # Resolve per-sample PPR anchor nodes from this client's map.
+        per_sample_local_anchors: list[list[int]] = []
+        for s in samples:
+            idx = s.get("idx")
+            if idx is None or idx >= self._ppr_node_map.shape[0]:
+                raise RuntimeError(
+                    f"[client_{self.client_id}] Sample '{s.get('id')}' has no "
+                    f"valid dataset index (idx={idx})."
+                )
+            row = self._ppr_node_map[idx]                          # [top_k]
+            local = [int(n) for n in row.tolist() if n >= 0 and n < N]
+            if not local:
+                raise RuntimeError(
+                    f"[client_{self.client_id}] No PPR anchor nodes for sample "
+                    f"idx={idx} ('{s.get('id')}'). "
+                    "Run scripts/preprocess_fedcond_qa.py again."
+                )
+            per_sample_local_anchors.append(local)
 
-        # CPU subgraph extraction (1-hop expand + edge filter)
+        # CPU subgraph extraction + cosine-reranked desc
         out = []
-        for sample, seed_set in zip(samples, per_sample_seeds):
-            s = dict(sample)
-            if not seed_set:
-                out.append(s)
-                continue
+        for s, local_anchors in zip(samples, per_sample_local_anchors):
+            s = dict(s)
+            seed_set = set(local_anchors)
+
+            # 1-hop expansion
             kept_set = set(seed_set)
             for seed in seed_set:
                 kept_set.update(adj[seed])
             kept_list = sorted(kept_set)
-            if not kept_list:
-                out.append(s)
-                continue
+
             local_map = {gid: lid for lid, gid in enumerate(kept_list)}
             kept_t = torch.tensor(kept_list, dtype=torch.long)
             src_e, dst_e = [], []
@@ -396,8 +395,16 @@ class FedCondQAClient:
             )
             if node_text is not None and isinstance(node_text, (list, tuple)) and len(node_text) == N:
                 graph.node_text = [node_text[i] for i in kept_list]
-            s["graph"] = graph          # keep on CPU; model moves it during forward
+            s["graph"] = graph
             s["evidence_graph"] = graph
+
+            # NOTE: desc is intentionally NOT overwritten with PPR-ranked passage texts.
+            # The evidence graph (built above from PPR anchor nodes) already carries
+            # the federated local knowledge as GNN soft-prompt tokens. Replacing desc
+            # with PPR passages would substitute gold MuSiQue evidence (which contains
+            # the answer) with trigraph passages that may belong to the wrong client
+            # shard and therefore contain irrelevant content for a given query.
+
             out.append(s)
         return out
 

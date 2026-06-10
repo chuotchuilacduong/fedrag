@@ -24,11 +24,11 @@ class GCN(torch.nn.Module):
 
     def forward(self, x, adj_t, edge_attr):
         for i, conv in enumerate(self.convs[:-1]):
-            x = conv(x, adj_t)
+            x = conv(x, adj_t, edge_attr)
             x = self.bns[i](x)
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.convs[-1](x, adj_t)
+        x = self.convs[-1](x, adj_t, edge_attr)
         return x, edge_attr
 
 

@@ -113,7 +113,7 @@ class EvidenceLinearRAG(LinearRAGRetriever):
         working_dir,
         dataset_name,
         encoder=None,
-        spacy_model: str = "en_core_web_trf",
+        spacy_model: str = "en_core_web_sm",
         llm_model: Any = None,
         **config_kwargs,
     ):
@@ -130,21 +130,11 @@ class EvidenceLinearRAG(LinearRAGRetriever):
         # Use _CaptureLinearRAG instead of LinearRAG
         self._rag = _CaptureLinearRAG(global_config=cfg)
         self._indexed = False
+        self._prepared = False  # True after first retrieve call builds lookup arrays
 
-    def retrieve_with_evidence(
-        self,
-        questions: list[dict],
-    ) -> list[EvidenceRetrievalResult]:
-        """Like retrieve() but returns EvidenceRetrievalResult with intermediate state.
-
-        Must call index() first.
-        """
-        if not self._indexed:
-            raise RuntimeError("Call index() before retrieve_with_evidence()")
-
+    def _prepare(self) -> None:
+        """Build lookup arrays from embedding stores — called once after index()."""
         rag = self._rag
-
-        # Replicate the retrieve() setup prologue exactly as LinearRAG.retrieve() does
         rag.entity_hash_ids = list(rag.entity_embedding_store.hash_id_to_text.keys())
         rag.entity_embeddings = np.array(rag.entity_embedding_store.embeddings)
         rag.passage_hash_ids = list(rag.passage_embedding_store.hash_id_to_text.keys())
@@ -157,6 +147,23 @@ class EvidenceLinearRAG(LinearRAGRetriever):
         rag.vertex_idx_to_node_name = {
             v.index: v["name"] for v in rag.graph.vs if "name" in v.attributes()
         }
+        self._prepared = True
+
+    def retrieve_with_evidence(
+        self,
+        questions: list[dict],
+    ) -> list[EvidenceRetrievalResult]:
+        """Like retrieve() but returns EvidenceRetrievalResult with intermediate state.
+
+        Must call index() first.
+        """
+        if not self._indexed:
+            raise RuntimeError("Call index() before retrieve_with_evidence()")
+
+        if not self._prepared:
+            self._prepare()
+
+        rag = self._rag
 
         results = []
         for q_info in questions:

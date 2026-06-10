@@ -1,5 +1,7 @@
 import re
 import string
+from collections import Counter
+
 import pandas as pd
 
 
@@ -16,6 +18,26 @@ def normalize(s: str) -> str:
 
 def match(s1: str, s2: str) -> bool:
     return normalize(s2) in normalize(s1)
+
+
+def exact_match(prediction: str, answer: str) -> bool:
+    """SQuAD-style EM: normalized strings must be identical."""
+    return normalize(prediction) == normalize(answer)
+
+
+def token_f1(prediction: str, answer: str) -> float:
+    """SQuAD/MuSiQue-style token-level F1 on normalized strings."""
+    pred_tokens = normalize(prediction).split()
+    gold_tokens = normalize(answer).split()
+    if not pred_tokens or not gold_tokens:
+        return float(pred_tokens == gold_tokens)
+    common = Counter(pred_tokens) & Counter(gold_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0.0
+    precision = num_same / len(pred_tokens)
+    recall = num_same / len(gold_tokens)
+    return 2 * precision * recall / (precision + recall)
 
 
 def eval_f1(prediction, answer):

@@ -48,7 +48,7 @@ def parse_args_llama():
     parser.add_argument("--gnn_num_heads", type=int, default=4)
     parser.add_argument("--gnn_num_heads_c", type=int, default=None)
     parser.add_argument("--gnn_dropout", type=float, default=0.0)
-    parser.add_argument("--dual_graph_mode", type=str, default='both')
+    parser.add_argument("--dual_graph_mode", type=str, default='shared')
 
     args = parser.parse_args()
     return args

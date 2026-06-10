@@ -34,7 +34,6 @@ class ClientCondensationConfig:
     self_expr_step_size: float = 1e-2
     self_expr_alpha: float = 8.0
     self_expr_beta: float = 5.0
-    out_dim: int | None = None
     preserve_sep_topology: bool = True
 
 
@@ -79,11 +78,7 @@ class ClientCondensor(nn.Module):
     def __init__(self, graph_dim: int, text_dim: int, config: ClientCondensationConfig | None = None):
         super().__init__()
         self.config = config or ClientCondensationConfig()
-        out_dim = self.config.out_dim or graph_dim
-        self.W_q = nn.Linear(graph_dim, text_dim)
-        self.W_k = nn.Linear(text_dim, text_dim)
-        self.W_s = nn.Linear(graph_dim, text_dim)
-        self.fusion = GraphTextFusion(graph_dim=graph_dim, text_dim=text_dim, out_dim=out_dim)
+        self.fusion = GraphTextFusion(graph_dim=graph_dim, text_dim=text_dim)
 
     def forward(
         self,
@@ -118,9 +113,6 @@ class ClientCondensor(nn.Module):
             graph_embeddings=graph_embeddings,
             node_text_embeddings=node_text_embeddings,
             chunk_embeddings=chunk_embeddings,
-            W_q=self.W_q,
-            W_k=self.W_k,
-            W_s=self.W_s,
             hop_weights=hop_weights,
             budgets=cfg.text_budgets,
             chunk_budget=cfg.chunk_budget,
@@ -202,9 +194,10 @@ def condense_client_graph(
         text_dim=int(text_bank.node_embeddings.size(1)),
         config=config,
     ).to(graph_embeddings.device)
-    return condensor(
-        tri_graph,
-        text_bank=text_bank,
-        graph_embeddings=graph_embeddings,
-        return_artifacts=return_artifacts,
-    )
+    with torch.no_grad():
+        return condensor(
+            tri_graph,
+            text_bank=text_bank,
+            graph_embeddings=graph_embeddings,
+            return_artifacts=return_artifacts,
+        )

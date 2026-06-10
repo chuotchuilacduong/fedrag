@@ -72,20 +72,21 @@ def encode_passages(
     encoder: SentenceTransformer,
     batch_size: int = 256,
     device: str = "cuda",
+    max_slots: int = 30,
 ) -> torch.Tensor:
-    """Returns [N, 10, 384] float16 passage embeddings.
+    """Returns [N, max_slots, 384] float16 passage embeddings.
 
     Records missing the kth passage are zero-padded (kept as zeros).
     """
     n = len(records)
-    out = torch.zeros(n, 10, encoder.get_sentence_embedding_dimension(), dtype=torch.float16)
+    out = torch.zeros(n, max_slots, encoder.get_sentence_embedding_dimension(), dtype=torch.float16)
 
     # Flatten all passages so the encoder can batch them efficiently.
     texts: list[str] = []
     positions: list[tuple[int, int]] = []      # (record_idx, passage_idx) for each text
     for i, rec in enumerate(records):
         passages = rec.get("retrieved_passages", []) or []
-        for k, p in enumerate(passages[:10]):
+        for k, p in enumerate(passages[:max_slots]):
             texts.append(str(p))
             positions.append((i, k))
 
@@ -109,14 +110,15 @@ def encode_passages(
 def build_node_map(
     records: list[dict],
     title_map: dict[str, tuple[int, int]],
+    max_slots: int = 30,
 ) -> torch.Tensor:
-    """Returns [N, 10, 2] int32 — (client_id, node_id) or (-1, -1)."""
+    """Returns [N, max_slots, 2] int32 — (client_id, node_id) or (-1, -1)."""
     n = len(records)
-    out = torch.full((n, 10, 2), -1, dtype=torch.int32)
+    out = torch.full((n, max_slots, 2), -1, dtype=torch.int32)
     n_hits, n_total = 0, 0
     for i, rec in enumerate(tqdm(records, desc="  mapping passages → nodes")):
         passages = rec.get("retrieved_passages", []) or []
-        for k, p in enumerate(passages[:10]):
+        for k, p in enumerate(passages[:max_slots]):
             title = normalise_title(p)
             hit = title_map.get(title)
             n_total += 1
@@ -138,6 +140,8 @@ def main() -> int:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--skip-embs", action="store_true", help="Skip passage embedding build")
     parser.add_argument("--skip-map", action="store_true", help="Skip passage→node map build")
+    parser.add_argument("--max-slots", type=int, default=30,
+                        help="Max passages per record to map (default 30 = 10 per client × 3 clients)")
     args = parser.parse_args()
 
     qa_root = Path(args.qa_root)
@@ -151,7 +155,7 @@ def main() -> int:
     if not args.skip_map:
         print("[2/3] building global title → node map", flush=True)
         title_map = build_global_title_map(processed_root, args.num_clients)
-        node_map = build_node_map(records, title_map)
+        node_map = build_node_map(records, title_map, max_slots=args.max_slots)
         out_map = qa_root / "passage_node_map.pt"
         torch.save(node_map, out_map)
         print(f"    saved {out_map}  ({tuple(node_map.shape)})", flush=True)
@@ -161,7 +165,8 @@ def main() -> int:
     if not args.skip_embs:
         print(f"[3/3] encoding passages with {args.encoder}", flush=True)
         encoder = SentenceTransformer(args.encoder, device=args.device)
-        embs = encode_passages(records, encoder, batch_size=args.batch_size, device=args.device)
+        embs = encode_passages(records, encoder, batch_size=args.batch_size,
+                               device=args.device, max_slots=args.max_slots)
         out_embs = qa_root / "passage_embs.pt"
         torch.save(embs, out_embs)
         print(f"    saved {out_embs}  ({tuple(embs.shape)}, {embs.dtype})", flush=True)

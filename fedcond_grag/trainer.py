@@ -25,6 +25,7 @@ import torch
 
 from fedcond_grag.client.client import FedCondQAClient
 from fedcond_grag.server.server import FedCondQAServer
+from fedcond_grag.utils.evaluate import exact_match, normalize, token_f1
 
 
 class FedTrainer:
@@ -67,7 +68,7 @@ class FedTrainer:
                 import wandb
                 # Auto-generate a descriptive run name from dual_graph_mode when
                 # no explicit name is given, so ablations are easy to filter on WandB.
-                _mode = getattr(args, "dual_graph_mode", "both")
+                _mode = getattr(args, "dual_graph_mode", "shared")
                 _auto_names = {
                     "both": "dual-encoder",
                     "dual": "dual-encoder",
@@ -164,17 +165,22 @@ class FedTrainer:
             print(f"    server agg done in {agg_time:.1f}s", flush=True)
 
             train_acc = val_acc = test_acc = None
+            val_metrics = test_metrics = None
             eval_time = None
             eval_every = int(getattr(self.args, "eval_every", 1))
             do_eval = round_id >= 1 and self.shared_model is not None and (round_id % eval_every == 0)
             if do_eval:
                 t_eval = time.perf_counter()
                 if self._val_samples:
-                    val_acc = self._eval_split_acc(self._val_samples)
-                    print(f"    val   acc : {val_acc:.1f}%", flush=True)
+                    val_metrics = self._eval_split_acc(self._val_samples)
+                    val_acc = val_metrics["hit"]
+                    print(f"    val   : hit {val_metrics['hit']:.1f}% | "
+                          f"EM {val_metrics['em']:.1f}% | F1 {val_metrics['f1']:.1f}", flush=True)
                 if self._test_samples:
-                    test_acc = self._eval_split_acc(self._test_samples)
-                    print(f"    test  acc : {test_acc:.1f}%", flush=True)
+                    test_metrics = self._eval_split_acc(self._test_samples)
+                    test_acc = test_metrics["hit"]
+                    print(f"    test  : hit {test_metrics['hit']:.1f}% | "
+                          f"EM {test_metrics['em']:.1f}% | F1 {test_metrics['f1']:.1f}", flush=True)
                 eval_time = time.perf_counter() - t_eval
                 print(f"    eval done in {eval_time:.1f}s", flush=True)
 
@@ -193,6 +199,10 @@ class FedTrainer:
                 "train_acc": train_acc,
                 "val_acc": val_acc,
                 "test_acc": test_acc,
+                "val_em": val_metrics["em"] if val_metrics else None,
+                "val_f1": val_metrics["f1"] if val_metrics else None,
+                "test_em": test_metrics["em"] if test_metrics else None,
+                "test_f1": test_metrics["f1"] if test_metrics else None,
             }
             round_metrics.append(metrics)
             self._log_metrics(metrics, global_step=global_step)
@@ -203,8 +213,13 @@ class FedTrainer:
     # Evaluation
     # ------------------------------------------------------------------
 
-    def _eval_split_acc(self, samples: list) -> float:
-        """Distribute samples across clients, run inference with on-the-fly retrieval."""
+    def _eval_split_acc(self, samples: list) -> dict:
+        """Distribute samples across clients, run inference with on-the-fly retrieval.
+
+        Returns {"hit", "em", "f1"} in percent — hit is the legacy normalized
+        substring containment; em/f1 are SQuAD/MuSiQue-style exact match and
+        token-level F1.
+        """
         from fedcond_grag.client.stage_d_retrieve.global_graph_retriever import GlobalGraphRetriever
         from fedcond_grag.utils.collate import collate_fn
 
@@ -213,6 +228,8 @@ class FedTrainer:
         top_r = int(getattr(self.args, "retrieval_top_r", 16))
         n_clients = len(self.clients)
         hits = 0
+        em_total = 0.0
+        f1_total = 0.0
         self.shared_model.eval()
 
         with torch.no_grad():
@@ -232,10 +249,18 @@ class FedTrainer:
                     batch = collate_fn(mini)
                     out = self.shared_model.inference(batch)
                     for pred, label in zip(out["pred"], out["label"]):
-                        if label.strip().lower() in pred.strip().lower():
+                        if normalize(label) in normalize(pred):
                             hits += 1
+                        if exact_match(pred, label):
+                            em_total += 1.0
+                        f1_total += token_f1(pred, label)
 
-        return 100.0 * hits / max(len(samples), 1)
+        n = max(len(samples), 1)
+        return {
+            "hit": 100.0 * hits / n,
+            "em": 100.0 * em_total / n,
+            "f1": 100.0 * f1_total / n,
+        }
 
     def _log_metrics(self, metrics: dict, global_step: int = 0) -> None:
         with self._metrics_path.open("a") as f:
@@ -257,6 +282,9 @@ class FedTrainer:
             log["round/val_acc"] = metrics["val_acc"]
         if metrics["test_acc"] is not None:
             log["round/test_acc"] = metrics["test_acc"]
+        for key in ("val_em", "val_f1", "test_em", "test_f1"):
+            if metrics.get(key) is not None:
+                log[f"round/{key}"] = metrics[key]
         # Timing
         for cid, t in metrics.get("client_times", {}).items():
             log[f"round/client_{cid}_time_s"] = t
@@ -402,7 +430,7 @@ class FedTrainer:
             ("gnn_in_dim",       384),    ("gnn_in_dim_c",      None),
             ("gnn_hidden_dim",   384),    ("gnn_hidden_dim_c",  None),
             ("gnn_num_heads",    4),      ("gnn_num_heads_c",   None),
-            ("gnn_dropout",      0.0),    ("dual_graph_mode",   "both"),
+            ("gnn_dropout",      0.0),    ("dual_graph_mode",   "shared"),
             ("max_txt_len",      512),    ("max_new_tokens",    32),
             ("llm_frozen",       "True"),
         ):

@@ -80,18 +80,21 @@ def score_and_select(
     g_v: Tensor,
     neighbor_text_embs: Tensor,
     *,
-    W_q: nn.Module | None = None,
-    W_k: nn.Module | None = None,
     budget: int,
 ) -> Tensor:
-    """Apply Eq. 5 scoring and phase-1 top-k softmax selection."""
+    """Relevance-based selection: cosine(core node, neighbor text) → top-budget.
+
+    Scores each candidate by cosine similarity to the core node's graph
+    embedding (both live in the MiniLM space), then keeps the top-budget
+    candidates with softmax weights over their scores.
+    """
 
     if neighbor_text_embs.numel() == 0:
         return neighbor_text_embs.new_zeros((0,))
-    q = W_q(g_v) if W_q is not None else g_v
-    k = W_k(neighbor_text_embs) if W_k is not None else neighbor_text_embs
-    scores = k @ q / sqrt(max(q.numel(), 1))
-    return topk_softmax(scores, k=budget)
+    query = torch.nn.functional.normalize(g_v.reshape(-1).float(), dim=0)
+    keys = torch.nn.functional.normalize(neighbor_text_embs.float(), dim=-1)
+    scores = keys @ query
+    return topk_softmax(scores, int(budget)).to(neighbor_text_embs.dtype)
 
 
 def hierarchical_text_condensation(
@@ -101,9 +104,6 @@ def hierarchical_text_condensation(
     graph_embeddings: Tensor,
     node_text_embeddings: Tensor,
     chunk_embeddings: Sequence[Tensor],
-    W_q: nn.Module | None = None,
-    W_k: nn.Module | None = None,
-    W_s: nn.Module | None = None,
     hop_weights: Tensor | None = None,
     budgets: tuple[int, int, int] = (1, 3, 2),
     chunk_budget: int = 8,
@@ -150,7 +150,7 @@ def hierarchical_text_condensation(
                 continue
 
             text = node_text_embeddings[candidates].to(device=device, dtype=graph_embeddings.dtype)
-            weights = score_and_select(g_v, text, W_q=W_q, W_k=W_k, budget=budget)
+            weights = score_and_select(g_v, text, budget=budget)
             selected_idx = (weights > 0).nonzero(as_tuple=False).flatten().tolist()
             selected_nodes = [int(candidates[i]) for i in selected_idx]
             selected_weights = weights[selected_idx]
@@ -168,7 +168,6 @@ def hierarchical_text_condensation(
             g_v,
             selected_nodes_for_chunks,
             chunk_embeddings,
-            scorer=W_s,
             budget=chunk_budget,
         )
         t_tilde_rows.append(t_tilde_v)
