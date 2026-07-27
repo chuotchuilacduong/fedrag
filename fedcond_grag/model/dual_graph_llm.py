@@ -26,7 +26,7 @@ class DualGraphLLM(GraphLLM):
             else:
                 print("[DualGraphLLM] no-synthetic ablation: both slots use evidence graph (server synthetic graph ignored)")
         else:
-            gnn_model_name_c = getattr(args, "gnn_model_name_c", "gat")
+            gnn_model_name_c = getattr(args, "gnn_model_name_c", "gcn")
             gnn_num_layers_c = getattr(args, "gnn_num_layers_c", None) or args.gnn_num_layers
             gnn_num_heads_c = getattr(args, "gnn_num_heads_c", None) or args.gnn_num_heads
             gnn_hidden_dim_c = getattr(args, "gnn_hidden_dim_c", None) or args.gnn_hidden_dim
@@ -76,6 +76,14 @@ class DualGraphLLM(GraphLLM):
             raise KeyError("DualGraphLLM requires samples['graph'] or samples['evidence_graph']")
 
         z_e = self._encode_one_graph(evidence_graph, self.graph_encoder, self.projector)
+
+        # Soft synthetic context override (FedRAG query-conditioned memory
+        # adaptation): a precomputed [B, H] tensor takes the condensed slot so
+        # gradients flow through differentiable soft retrieval to Θ_syn.
+        z_c_soft = samples.get("z_c_soft")
+        if z_c_soft is not None:
+            z_c = z_c_soft.to(device=z_e.device, dtype=z_e.dtype)
+            return self._apply_dual_graph_mode(z_e, z_c)
 
         condensed_graph = samples.get("condensed_graph")
         if self.dual_graph_mode == "no_synthetic":

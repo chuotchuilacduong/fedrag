@@ -93,7 +93,7 @@ class TriGraphBuilder:
     spacy_model: str = "en_core_web_sm"
 
     def build(self, passages: Sequence[str]) -> Data:
-        from fedcond_grag.linearrag import LinearRAG, LinearRAGConfig
+        from fedcond_grag.baselines.linearrag import LinearRAG, LinearRAGConfig
 
         enc = self.encoder or load_encoder(DEFAULT_MODEL)
         cfg = LinearRAGConfig(

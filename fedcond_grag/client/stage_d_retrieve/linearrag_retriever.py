@@ -24,7 +24,7 @@ from typing import Any
 
 from torch_geometric.data import Data
 
-from fedcond_grag.linearrag import LinearRAG, LinearRAGConfig
+from fedcond_grag.baselines.linearrag import LinearRAG, LinearRAGConfig
 from fedcond_grag.client.stage_a_trigraph.node_encoder import DEFAULT_MODEL, load_encoder
 from fedcond_grag.client.stage_a_trigraph.trigraph_builder import _rag_to_pyg
 

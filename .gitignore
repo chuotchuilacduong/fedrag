@@ -57,6 +57,10 @@ docs/_build/
 # logs and results
 logs/
 output/
+outputs/
+
+# runtime PID files
+*.pid
 
 # wandb
 wandb/
@@ -76,8 +80,10 @@ processed/
 
 # Datasets (downloaded / derived — too large for git)
 dataset/fedcond_qa/
+dataset/fedcond_qa_medical_backup/
 dataset/linearrag/hotpotqa/chunks.json
 dataset/linearrag/hotpotqa/questions.json
+dataset/raw/
 
 # Large binary tensors
 *.pt

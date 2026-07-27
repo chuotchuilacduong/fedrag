@@ -38,7 +38,7 @@ def parse_args_llama():
 
     # GNN related
     parser.add_argument("--gnn_model_name", type=str, default='gt')
-    parser.add_argument("--gnn_model_name_c", type=str, default='gat')
+    parser.add_argument("--gnn_model_name_c", type=str, default='gcn')
     parser.add_argument("--gnn_num_layers", type=int, default=4)
     parser.add_argument("--gnn_num_layers_c", type=int, default=None)
     parser.add_argument("--gnn_in_dim", type=int, default=1024)

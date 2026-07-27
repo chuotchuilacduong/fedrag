@@ -62,13 +62,37 @@ class GraphLLM(torch.nn.Module):
         print('Loading LLAMA')
         import torch
         n_gpus = torch.cuda.device_count()
-        max_memory = {i: '80GiB' for i in range(n_gpus)} if n_gpus > 0 else None
+        max_memory = None
+        if n_gpus > 0:
+            gpu_gib = getattr(args, "llm_gpu_max_memory_gib", None)
+            if gpu_gib is None:
+                # Auto-detect actual VRAM instead of assuming a datacenter GPU.
+                # `max_memory` is a static weight-placement budget for
+                # `device_map="auto"` -- it doesn't account for activations/CUDA
+                # context, so reserve some headroom off the reported total.
+                total_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                gpu_gib = max(1.0, total_gib - 1.5)
+            max_memory = {i: f"{gpu_gib:.1f}GiB" for i in range(n_gpus)}
+            # Opt-in CPU RAM overflow for models too big for VRAM alone (e.g. a
+            # 7B model on an 8GB card) -- accelerate places whatever doesn't fit
+            # in max_memory[gpu] here instead of OOMing. Off by default: without
+            # --llm-cpu-max-memory-gib, behavior is unchanged (GPU-only, and
+            # from_pretrained raises a clear "doesn't fit" error instead of
+            # silently trying to over-allocate the GPU).
+            cpu_gib = getattr(args, "llm_cpu_max_memory_gib", None)
+            if cpu_gib:
+                max_memory["cpu"] = f"{cpu_gib}GiB"
         kwargs = {
             "device_map": "auto",
             "revision": "main",
         }
         if max_memory:
             kwargs["max_memory"] = max_memory
+        # Layers accelerate dispatches to "cpu" under a 4-bit/8-bit quant config
+        # must stay in fp32 (bnb's quantized kernels are CUDA-only) -- bnb/
+        # transformers require this flag set whenever any module maps to
+        # cpu/disk, or from_pretrained raises. Harmless when unused (GPU-only).
+        _cpu_offload_enabled = bool(max_memory and "cpu" in max_memory)
 
         self.tokenizer = AutoTokenizer.from_pretrained(args.llm_model_path, use_fast=False, revision=kwargs["revision"])
         if self.tokenizer.pad_token_id is None:
@@ -83,6 +107,11 @@ class GraphLLM(torch.nn.Module):
         # Use PyTorch's built-in SDPA — automatically dispatches to the fastest
         # available kernel (Flash Attention on Ampere/Ada, memory-efficient on
         # older GPUs). No extra package needed; torch 2.x enables this by default.
+        # The cuDNN SDPA backend (newer torch versions) throws "No execution
+        # plans support the graph" on some GPU/cuDNN combinations — disable it
+        # so SDPA falls back to the flash/mem-efficient kernels instead.
+        if torch.cuda.is_available() and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            torch.backends.cuda.enable_cudnn_sdp(False)
         _attn_impl = "sdpa"
         print("Using SDPA attention (Flash Attention kernel auto-selected)")
 
@@ -92,6 +121,7 @@ class GraphLLM(torch.nn.Module):
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_use_double_quant=True,
+                llm_int8_enable_fp32_cpu_offload=_cpu_offload_enabled,
             )
             model = AutoModelForCausalLM.from_pretrained(
                 args.llm_model_path,
@@ -101,11 +131,19 @@ class GraphLLM(torch.nn.Module):
                 **kwargs
             )
         else:
+            # Newer transformers releases dropped the load_in_8bit= kwarg from
+            # from_pretrained (it's silently forwarded to the model ctor and
+            # crashes there) — go through quantization_config like the 4-bit
+            # branch above instead.
+            quant_cfg = (
+                BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=_cpu_offload_enabled)
+                if load_in_8bit else None
+            )
             model = AutoModelForCausalLM.from_pretrained(
                 args.llm_model_path,
                 torch_dtype=None if load_in_8bit else torch.float16,
                 low_cpu_mem_usage=True,
-                load_in_8bit=load_in_8bit,
+                quantization_config=quant_cfg,
                 attn_implementation=_attn_impl,
                 **kwargs
             )
@@ -117,13 +155,12 @@ class GraphLLM(torch.nn.Module):
         else:
             print("Training LLAMA with LORA!")
             model = prepare_model_for_kbit_training(model)
-            lora_r: int = 8
-            lora_alpha: int = 16
-            lora_dropout: float = 0.05
-            lora_target_modules = [
-                "q_proj",
-                "v_proj",
-            ]
+            lora_r = int(getattr(args, "lora_rank", 8))
+            lora_alpha = int(getattr(args, "lora_alpha", 16))
+            lora_dropout = float(getattr(args, "lora_dropout", 0.05))
+            lora_target_modules = getattr(args, "lora_target_modules", None) or ["q_proj", "v_proj"]
+            if isinstance(lora_target_modules, str):
+                lora_target_modules = [m.strip() for m in lora_target_modules.split(",") if m.strip()]
             config = LoraConfig(
                 r=lora_r,
                 lora_alpha=lora_alpha,
@@ -175,6 +212,13 @@ class GraphLLM(torch.nn.Module):
             nn.GELU(),
             nn.Linear(2048, llm_hidden_size),
         ).to(dtype=_gnn_dtype, device=_true_device)
+
+        # No condensed/global-graph channel on the plain single-graph model —
+        # declared (as None, not omitted) so callers that duck-type against
+        # DualGraphLLM's attribute surface (e.g. FedCondQAClient.set_shared_model
+        # / local_train) work unmodified when driving a GraphLLM instance too.
+        self.condensed_encoder = None
+        self.projector_c = None
 
         # Cache device + special-token embeddings so we don't iterate all
         # parameters or rebuild bos/pad embeddings on every forward pass.

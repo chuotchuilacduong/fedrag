@@ -14,6 +14,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch_geometric.data import Data
 
 from fedcond_grag.server.stage_c_aggregate.task import CondensationQATask
+from fedcond_grag.server.lora_aggregate import has_lora, lora_state_dict
 from fedcond_grag.client.stage_b_condense import ClientCondensationConfig, ClientCondensor, AnchorSelectorConfig
 from fedcond_grag.client.stage_b_condense.node_text_embedder import NodeTextBank, build_text_bank, load_frozen_encoder
 from fedcond_grag.client.stage_d_retrieve.global_graph_retriever import GlobalGraphRetriever
@@ -47,6 +48,16 @@ class FedCondQAClient:
         self.shared_model: DualGraphLLM | None = None
         self.local_qa_samples: list = []
         self.synthetic_graph: Data | None = None
+        # Stage E (FedRAG Phase 1) — broadcast Θ_syn state + outgoing delta Δ_m
+        self._synthetic_state: dict | None = None
+        self._syn_delta: dict | None = None
+        # Stage B refinement (paper B.3.5) runs once per client lifetime
+        self._condense_refined: bool = False
+        # Paper Phase 0: the anchor graph G̃_m is uploaded exactly once
+        # (fedrag mode); legacy modes keep re-sending it every round.
+        self._anchor_uploaded: bool = False
+        # Stage B refine stats for the trainer to log (consumed once)
+        self.last_stage_b_refine: dict | None = None
         self._model_weights: dict | None = None   # per-client GNN/proj state dicts
         self._num_local_samples: int = 0
         self._local_adj: list | None = None    # CPU adjacency lists for trigraph
@@ -123,6 +134,8 @@ class FedCondQAClient:
             **({"projector_c": copy.deepcopy(model.projector_c.state_dict())}
                if model.projector_c is not None else {}),
         }
+        if has_lora(model.model):
+            self._model_weights["lora"] = lora_state_dict(model.model)
 
     # ------------------------------------------------------------------
     # FL round methods
@@ -136,9 +149,13 @@ class FedCondQAClient:
         if synthetic_graph is not None:
             self.synthetic_graph = synthetic_graph
 
+        # Θ_syn = {X_syn, θ_PGE} broadcast for query-conditioned adaptation
+        self._synthetic_state = msg.get("synthetic_state", self._synthetic_state)
+        self._syn_delta = None
+
         model_weights = msg.get("model_weights")
         if model_weights and self._model_weights is not None:
-            for key in ("graph_encoder", "projector", "condensed_encoder", "projector_c"):
+            for key in ("graph_encoder", "projector", "condensed_encoder", "projector_c", "lora"):
                 if key in model_weights:
                     self._model_weights[key] = {
                         k: v.clone() for k, v in model_weights[key].items()
@@ -152,7 +169,7 @@ class FedCondQAClient:
             if self.condensed_graph is None:
                 cached = self._try_load_condensed_cache()
                 if cached is not None:
-                    self.condensed_graph = cached
+                    self.condensed_graph = self._maybe_refine_condensed(cached)
                     self.message_pool[f"client_{self.client_id}_extra_compute"] = (
                         self.message_pool.get(f"client_{self.client_id}_extra_compute", 0.0)
                         + time.perf_counter() - start
@@ -176,13 +193,21 @@ class FedCondQAClient:
         # Load this client's weights into the shared model
         self._load_weights_into_model()
 
+        # Paper B.5.2: during training the synthetic context is retrieved
+        # softly/differentiably from Θ_syn^(r,0); hard top-k retrieval over
+        # the exported synthetic graph is inference/eval-only.
+        soft_syn = (
+            self._prepare_soft_syn_context()
+            if str(getattr(self.args, "server_stage_c_mode", "")) == "fedrag"
+            else None
+        )
         retriever = (
             GlobalGraphRetriever(
                 self.synthetic_graph,
                 top_r=int(getattr(self.args, "retrieval_top_r", 16)),
                 max_nodes=getattr(self.args, "retrieval_max_nodes", None),
             )
-            if self.synthetic_graph is not None
+            if (self.synthetic_graph is not None and soft_syn is None)
             else None
         )
 
@@ -194,6 +219,25 @@ class FedCondQAClient:
             + (list(self.shared_model.projector_c.parameters())
                if self.shared_model.projector_c is not None else [])
         )
+        lora_enabled = has_lora(self.shared_model.model)
+        if lora_enabled:
+            # RoLoRA alternates which half is trainable by round parity; every
+            # other strategy just trains both halves every round. Both halves
+            # stay registered with the (persistent) optimizer regardless --
+            # AdamW skips params whose .grad is None, so toggling
+            # requires_grad here is enough without rebuilding the optimizer.
+            agg_method = str(getattr(self.args, "lora_agg_method", "fedit")).lower()
+            round_id = int(self.message_pool.get("round", 0))
+            active_half = "lora_B" if round_id % 2 == 1 else "lora_A"
+            lora_params = []
+            for name, param in self.shared_model.model.named_parameters():
+                if ".lora_A." in name or ".lora_B." in name:
+                    if agg_method == "rolora":
+                        param.requires_grad_(f".{active_half}." in name)
+                    else:
+                        param.requires_grad_(True)
+                    lora_params.append(param)
+            trainable += lora_params
         if self._optimizer is None:
             self._optimizer = torch.optim.AdamW(
                 trainable,
@@ -227,6 +271,8 @@ class FedCondQAClient:
                 if retriever is not None:
                     mini = self._attach_condensed_graphs(mini, retriever)
                 batch = collate_fn(mini)
+                if soft_syn is not None:
+                    batch["z_c_soft"] = self._soft_syn_batch_context(batch, soft_syn)
                 optimizer.zero_grad()
                 loss = self.shared_model(batch)
                 loss.backward()
@@ -269,18 +315,240 @@ class FedCondQAClient:
             **({"projector_c": copy.deepcopy(self.shared_model.projector_c.state_dict())}
                if self.shared_model.projector_c is not None else {}),
         }
+        if lora_enabled:
+            self._model_weights["lora"] = lora_state_dict(self.shared_model.model)
         return total_loss / max(total_steps, 1), total_steps
 
-    def send_message(self) -> None:
-        if self.condensed_graph is None:
-            self.condensed_graph = self._condense_anchor_graph(self.tri_graph)
-        msg: dict = {
-            "anchor_graph": self.condensed_graph,
-            "num_anchor_nodes": int(self.condensed_graph.x.size(0)),
+    def adapt_synthetic_memory(self) -> float | None:
+        """FedRAG Phase 1 (paper §3.5 / B.7): K_mem local steps on a copy of Θ_syn.
+
+        Minimizes L_mem = L_QA + λ_gm·L_GM + λ_align·L_align + λ_reg·L_reg on
+        private mini-batches, then stores Δ_m = Θ_syn,m − Θ_syn for upload.
+        The prompt module W stays fixed here — only the local synthetic-memory
+        copy is optimized. Returns the mean QA loss under synthetic context,
+        or None if adaptation is disabled or prerequisites are missing.
+        """
+        from fedcond_grag.client.stage_e_memory import (
+            LocalSyntheticMemory,
+            gradient_matching_loss,
+        )
+        from fedcond_grag.server.stage_c_aggregate.repr_align import (
+            encode_nodes,
+            encode_nodes_with_edge_weight,
+        )
+
+        k_mem = int(getattr(self.args, "syn_mem_steps", 5))
+        if (
+            k_mem <= 0
+            or self._synthetic_state is None
+            or self.shared_model is None
+            or not self.local_qa_samples
+        ):
+            return None
+
+        model = self.shared_model
+        if model.condensed_encoder is not None:
+            ctx_enc, ctx_proj = model.condensed_encoder, model.projector_c
+        else:
+            ctx_enc, ctx_proj = model.graph_encoder, model.projector
+        _param = next(ctx_proj.parameters())
+        device = _param.device
+
+        lambda_gm = float(getattr(self.args, "lambda_gm", 0.1))
+        lambda_align = float(getattr(self.args, "lambda_align_mem", 0.1))
+        lambda_reg = float(getattr(self.args, "lambda_reg_mem", 0.01))
+        lambda_syn_div = float(getattr(self.args, "lambda_div", 0.1))
+        lambda_deg = float(getattr(self.args, "lambda_deg", 0.05))
+        tau = float(getattr(self.args, "syn_soft_tau", 0.1))
+        lr = float(getattr(self.args, "syn_mem_lr", 1e-3))
+        batch_size = int(getattr(self.args, "syn_mem_batch_size", 0)) or int(
+            getattr(self.args, "local_batch_size", 4)
+        )
+
+        mem = LocalSyntheticMemory.from_broadcast(self._synthetic_state, device)
+        optimizer = torch.optim.Adam(mem.parameters(), lr=lr)
+        gm_params = [
+            p
+            for p in (*ctx_enc.parameters(), *ctx_proj.parameters())
+            if p.requires_grad
+        ]
+
+        # Client-condensed projections Z_m for L_align — W is fixed during
+        # adaptation, so compute once and detach (never uploaded).
+        z_client = None
+        if self.condensed_graph is not None and lambda_align > 0:
+            cg = self.condensed_graph.to(device)
+            with torch.no_grad():
+                ew = getattr(cg, "edge_weight", None)
+                if ew is not None and cg.edge_index.numel() > 0:
+                    z_client = encode_nodes_with_edge_weight(
+                        cg.x.float(), cg.edge_index, ew.float(), ctx_enc, ctx_proj
+                    ).detach()
+                else:
+                    z_client = encode_nodes(
+                        cg.x.float(), cg.edge_index, ctx_enc, ctx_proj
+                    ).detach()
+
+        qa_total = 0.0
+        for _ in range(k_mem):
+            mini = random.sample(
+                self.local_qa_samples, min(batch_size, len(self.local_qa_samples))
+            )
+            mini = self._attach_evidence_graphs(mini)
+            batch = collate_fn(mini)
+
+            # Retrieval query z̄_e — pooled evidence prompt rep (paper B.5.2)
+            with torch.no_grad():
+                z_query = model._encode_one_graph(
+                    batch["graph"], model.graph_encoder, model.projector
+                ).float()
+
+            # Differentiable soft synthetic retrieval → context token z_c
+            z_syn, adj_soft = mem.encode(ctx_enc, ctx_proj)
+            z_c = mem.soft_context(z_query, z_syn, tau=tau)  # [B, H] fp32, grad→Θ_syn
+
+            batch_syn = dict(batch)
+            batch_syn["z_c_soft"] = z_c
+            loss_qa = model(batch_syn)
+            qa_total += float(loss_qa.detach().cpu())
+
+            # Exact ∇_Θ L_QA via the context-token surrogate: Θ enters the loss
+            # only through z_c, so re-contracting the detached token gradient
+            # with z_c reproduces the chain rule without retaining the LLM graph.
+            grad_zc = torch.autograd.grad(loss_qa, z_c, retain_graph=False)[0]
+            qa_term = (grad_zc.detach() * z_c).sum()
+
+            loss_gm = z_c.new_zeros(())
+            if lambda_gm > 0:
+                # g_syn: context-branch prompt-module gradient under synthetic
+                # context, kept differentiable w.r.t. Θ_syn (first-order approx:
+                # the LLM-side token gradient is detached).
+                g_syn = torch.autograd.grad(
+                    qa_term, gm_params, create_graph=True, retain_graph=True,
+                    allow_unused=True,
+                )
+                # g_loc: same gradient under private local evidence context.
+                z_c_loc = model._encode_one_graph(batch["graph"], ctx_enc, ctx_proj)
+                batch_loc = dict(batch)
+                batch_loc["z_c_soft"] = z_c_loc
+                loss_loc = model(batch_loc)
+                grad_zc_loc = torch.autograd.grad(loss_loc, z_c_loc, retain_graph=False)[0]
+                loc_term = (grad_zc_loc.detach() * z_c_loc).sum()
+                g_loc = torch.autograd.grad(loc_term, gm_params, allow_unused=True)
+                loss_gm = gradient_matching_loss(list(g_loc), list(g_syn)).to(z_c.device)
+
+            loss_align = (
+                mem.alignment_loss(z_client, z_syn)
+                if z_client is not None
+                else z_c.new_zeros(())
+            )
+            loss_reg = mem.regularization(
+                z_syn, adj_soft, lambda_syn_div=lambda_syn_div, lambda_deg=lambda_deg
+            )
+
+            total = (
+                qa_term
+                + lambda_gm * loss_gm
+                + lambda_align * loss_align
+                + lambda_reg * loss_reg
+            )
+            optimizer.zero_grad()
+            total.backward()
+            clip_grad_norm_(list(mem.parameters()), 1.0)
+            optimizer.step()
+
+        # Adaptation deposits grads on prompt-module params — clear them so
+        # the next local_train round starts clean.
+        model.zero_grad(set_to_none=True)
+
+        self._syn_delta = mem.delta(self._synthetic_state)
+        return qa_total / max(k_mem, 1)
+
+    def _prepare_soft_syn_context(self) -> "dict | None":
+        """Fixed Θ_syn pieces for soft synthetic retrieval during prompt tuning.
+
+        Per Algorithm 1 (line 19) the synthetic memory stays frozen at its
+        broadcast value Θ_syn^(r,0) while W is tuned — only the prompt module
+        receives gradient through z_c. Edges come from the (fixed) PGE, so
+        they are computed once per round.
+        """
+        if self._synthetic_state is None or self.shared_model is None:
+            return None
+        from fedcond_grag.client.stage_e_memory import LocalSyntheticMemory
+
+        proj = (
+            self.shared_model.projector_c
+            if self.shared_model.projector_c is not None
+            else self.shared_model.projector
+        )
+        device = next(proj.parameters()).device
+        mem = LocalSyntheticMemory.from_broadcast(self._synthetic_state, device)
+        with torch.no_grad():
+            _, edge_index, edge_weight = mem.soft_edges()
+        return {
+            "x": mem.x.detach(),
+            "edge_index": edge_index.detach(),
+            "edge_weight": edge_weight.detach(),
         }
+
+    def _soft_syn_batch_context(self, batch: dict, soft_syn: dict) -> torch.Tensor:
+        """Differentiable soft synthetic retrieval (paper B.5.2).
+
+        z_c = Σ_i α_i(q)·z_i^syn with α = softmax(cos(z̄_e, z^syn)/τ), where
+        z̄_e is the pooled evidence prompt representation. z^syn is encoded by
+        the trainable context branch, so W is optimized through the synthetic
+        context exactly as in Eq. (13).
+        """
+        import torch.nn.functional as F
+
+        from fedcond_grag.server.stage_c_aggregate.repr_align import (
+            encode_nodes,
+            encode_nodes_with_edge_weight,
+        )
+
+        model = self.shared_model
+        if model.condensed_encoder is not None:
+            ctx_enc, ctx_proj = model.condensed_encoder, model.projector_c
+        else:
+            ctx_enc, ctx_proj = model.graph_encoder, model.projector
+        with torch.no_grad():
+            z_query = model._encode_one_graph(
+                batch["graph"], model.graph_encoder, model.projector
+            ).float()
+        if soft_syn["edge_index"].numel() > 0:
+            z_syn = encode_nodes_with_edge_weight(
+                soft_syn["x"], soft_syn["edge_index"], soft_syn["edge_weight"],
+                ctx_enc, ctx_proj,
+            )
+        else:
+            z_syn = encode_nodes(
+                soft_syn["x"], soft_syn["edge_index"], ctx_enc, ctx_proj
+            )
+        tau = float(getattr(self.args, "syn_soft_tau", 0.1))
+        q = F.normalize(z_query, dim=-1)
+        z = F.normalize(z_syn.float(), dim=-1)
+        alpha = torch.softmax(q @ z.T / max(tau, 1e-6), dim=-1)
+        return alpha @ z_syn.float()
+
+    def send_message(self) -> None:
+        mode = str(getattr(self.args, "server_stage_c_mode", ""))
+        # Paper Phase 0: G̃_m is uploaded exactly once during initialization
+        # (fedrag). Legacy server-side modes still consume anchors every round.
+        send_anchor = mode != "fedrag" or not self._anchor_uploaded
+        msg: dict = {}
+        if send_anchor:
+            if self.condensed_graph is None:
+                self.condensed_graph = self._condense_anchor_graph(self.tri_graph)
+            msg["anchor_graph"] = self.condensed_graph
+            msg["num_anchor_nodes"] = int(self.condensed_graph.x.size(0))
+            if mode == "fedrag":
+                self._anchor_uploaded = True
         if self._model_weights is not None and self._num_local_samples > 0:
             msg["model_weights"] = self._model_weights
             msg["num_samples"] = self._num_local_samples
+        if self._syn_delta is not None:
+            msg["syn_delta"] = self._syn_delta
+            msg.setdefault("num_samples", self._num_local_samples)
         self.message_pool[f"client_{self.client_id}"] = msg
 
     def upload(self) -> Data:
@@ -300,6 +568,8 @@ class FedCondQAClient:
             self.shared_model.condensed_encoder.load_state_dict(self._model_weights["condensed_encoder"])
         if self.shared_model.projector_c is not None and "projector_c" in self._model_weights:
             self.shared_model.projector_c.load_state_dict(self._model_weights["projector_c"])
+        if "lora" in self._model_weights:
+            self.shared_model.model.load_state_dict(self._model_weights["lora"], strict=False)
 
     def _attach_evidence_graphs(self, samples: list) -> list:
         """Build per-sample evidence subgraphs from per-query PPR anchor nodes.
@@ -398,12 +668,17 @@ class FedCondQAClient:
             s["graph"] = graph
             s["evidence_graph"] = graph
 
-            # NOTE: desc is intentionally NOT overwritten with PPR-ranked passage texts.
-            # The evidence graph (built above from PPR anchor nodes) already carries
-            # the federated local knowledge as GNN soft-prompt tokens. Replacing desc
-            # with PPR passages would substitute gold MuSiQue evidence (which contains
-            # the answer) with trigraph passages that may belong to the wrong client
-            # shard and therefore contain irrelevant content for a given query.
+            # desc = text of this client's own PPR-retrieved passage nodes, in
+            # PPR rank order. local_anchors are trigraph node ids for
+            # node_type==2 (Passage) nodes selected by EvidenceLinearRAG at
+            # preprocess time (scripts/preprocess_fedcond_qa.py), so this is
+            # the actual local retrieval result — not gold/oracle evidence.
+            if node_text is not None:
+                desc_texts = [
+                    node_text[i] for i in local_anchors[:top_k_desc] if i < len(node_text)
+                ]
+                if desc_texts:
+                    s["desc"] = "\n\n".join(desc_texts)
 
             out.append(s)
         return out
@@ -465,9 +740,90 @@ class FedCondQAClient:
 
         with torch.no_grad():
             condensed = self.condensor(graph, text_bank=self.text_bank).to_pyg_data()
+        condensed = self._maybe_refine_condensed(condensed, tri_graph=graph)
         condensed.y = condensed.node_type.long()
         condensed.num_global_classes = 3
         return condensed
+
+    def _maybe_refine_condensed(self, condensed: Data, tri_graph=None) -> Data:
+        """Stage B refinement (paper B.3.5): minimize the condensation objective
+
+            L_cond = L_ret + λ_rep·L_rep + λ_div·L_div
+
+        over the condensed node features before uploading G̃_m. L_ret is the
+        KL divergence between the full-graph and (soft-coverage-lifted)
+        condensed passage-retrieval distributions under the client's own local
+        training questions; without local questions L_ret is skipped and only
+        L_rep + L_div refine the features. Runs once per client lifetime.
+        """
+        iters = int(getattr(self.args, "condense_refine_iters", 100))
+        if iters <= 0 or self._condense_refined:
+            return condensed
+        from fedcond_grag.client.stage_b_condense import (
+            RetrievalRefineConfig,
+            refine_condensed_graph,
+        )
+
+        cap = int(getattr(self.args, "stage_b_max_queries", 256))
+        q_emb = self._local_query_embeddings(cap)
+        cfg = RetrievalRefineConfig(
+            iterations=iters,
+            lr=float(getattr(self.args, "condense_refine_lr", 1e-2)),
+            lambda_rep=float(getattr(self.args, "stage_b_lambda_rep", 1.0)),
+            lambda_div=float(getattr(self.args, "stage_b_lambda_div", 0.1)),
+            delta_margin=float(getattr(self.args, "stage_b_div_margin", 0.5)),
+            tau_ret=float(getattr(self.args, "stage_b_tau_ret", 0.1)),
+            tau_cov=float(getattr(self.args, "stage_b_tau_cov", 0.1)),
+            max_queries=cap,
+            knn_k=int(getattr(self.args, "stage_b_knn_k", 8)),
+            preserve_sep_topology=_as_bool(
+                getattr(self.args, "preserve_sep_topology", True)
+            ),
+        )
+        refined, hist = refine_condensed_graph(
+            tri_graph if tri_graph is not None else self.tri_graph,
+            condensed,
+            query_embeddings=q_emb,
+            config=cfg,
+        )
+        refined.y = refined.node_type.long()
+        refined.num_global_classes = 3
+        self._condense_refined = True
+        self.last_stage_b_refine = {
+            "l_cond_start": hist["total"][0],
+            "l_cond_end": hist["total"][-1],
+            "l_ret_start": hist["ret"][0],
+            "l_ret_end": hist["ret"][-1],
+        }
+        n_q = 0 if q_emb is None else min(int(q_emb.size(0)), cap)
+        ret_note = "" if n_q > 0 else ", L_ret skipped (no local queries)"
+        print(
+            f"    [client_{self.client_id}] Stage B refine (B.3.5): "
+            f"L_cond {hist['total'][0]:.4f} → {hist['total'][-1]:.4f} "
+            f"({iters} iters, {n_q} queries{ret_note})",
+            flush=True,
+        )
+        return refined
+
+    def _local_query_embeddings(self, cap: int) -> "torch.Tensor | None":
+        """Embed local training questions with the frozen sentence encoder.
+
+        Same encoder/space as the node features, so cosine retrieval
+        distributions in L_ret are well-defined. Queries never leave the
+        client — they only shape the refinement of G̃_m locally.
+        """
+        samples = self._train_pool or self.local_qa_samples
+        questions = [str(s.get("question", "")).strip() for s in samples]
+        questions = [q for q in questions if q][: max(cap, 0)]
+        if not questions:
+            return None
+        from fedcond_grag.client.stage_b_condense.node_text_embedder import (
+            encode_texts,
+            load_frozen_encoder,
+        )
+
+        encoder = load_frozen_encoder("all-MiniLM-L6-v2", dim=384)
+        return encode_texts(encoder, questions, device=self.device)
 
     def _stage_b_config(self) -> ClientCondensationConfig:
         motif = AnchorSelectorConfig(

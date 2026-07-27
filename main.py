@@ -85,6 +85,53 @@ def _run_fl_train(argv: list[str]) -> int:
     p.add_argument("--data-root", dest="data_root", default="processed")
     p.add_argument("--num-global-syn-nodes", dest="num_global_syn_nodes", type=int, default=128)
     p.add_argument("--server-condense-iters", dest="server_condense_iters", type=int, default=50)
+    p.add_argument("--server-stage-c-mode", dest="server_stage_c_mode", default="fedrag",
+                   choices=["fedrag", "gradient_match", "repr_align", "both"],
+                   help="Synthetic-graph refinement algorithm. 'fedrag' (default) = paper "
+                        "Algorithm 1: Phase-0 repr-align init, then client-side "
+                        "query-conditioned synthetic-memory adaptation with server delta "
+                        "aggregation. Legacy modes refine the synthetic graph server-side "
+                        "against client anchors every round.")
+    p.add_argument("--syn-mem-steps", dest="syn_mem_steps", type=int, default=5,
+                   help="K_mem: client-side synthetic-memory adaptation steps per round "
+                        "(fedrag mode; 0 disables adaptation → server only re-broadcasts)")
+    p.add_argument("--syn-mem-lr", dest="syn_mem_lr", type=float, default=1e-3,
+                   help="η_syn: client-side synthetic-memory Adam LR (fedrag mode)")
+    p.add_argument("--syn-mem-batch-size", dest="syn_mem_batch_size", type=int, default=0,
+                   help="Mini-batch size for memory adaptation (0 = --local-batch-size)")
+    p.add_argument("--syn-soft-tau", dest="syn_soft_tau", type=float, default=0.1,
+                   help="τ: temperature for differentiable soft synthetic retrieval")
+    p.add_argument("--lambda-gm", dest="lambda_gm", type=float, default=0.1,
+                   help="λ_gm: gradient-matching weight in L_mem (0 skips the extra "
+                        "local-evidence forward pass per adaptation step)")
+    p.add_argument("--lambda-align-mem", dest="lambda_align_mem", type=float, default=0.1,
+                   help="λ_align: client-side condensed↔synthetic alignment weight in L_mem")
+    p.add_argument("--lambda-reg-mem", dest="lambda_reg_mem", type=float, default=0.01,
+                   help="λ_reg: client-side synthetic-graph regularization weight in L_mem")
+    p.add_argument("--eta-agg", dest="eta_agg", type=float, default=1.0,
+                   help="η_agg: server step size applied to the aggregated memory delta")
+    p.add_argument("--eta-reg", dest="eta_reg", type=float, default=1e-2,
+                   help="η_reg: server L_reg gradient step size after delta aggregation")
+    p.add_argument("--server-reg-steps", dest="server_reg_steps", type=int, default=1,
+                   help="Server-side L_reg gradient steps per round (fedrag mode)")
+    p.add_argument("--condense-refine-iters", dest="condense_refine_iters", type=int, default=100,
+                   help="Stage B refinement steps minimizing L_cond = L_ret(KL) + "
+                        "λ_rep·L_rep + λ_div·L_div before uploading the anchor graph "
+                        "(paper B.3.5; 0 disables → constructive init only)")
+    p.add_argument("--condense-refine-lr", dest="condense_refine_lr", type=float, default=1e-2,
+                   help="Adam LR for Stage B condensed-feature refinement")
+    p.add_argument("--stage-b-lambda-rep", dest="stage_b_lambda_rep", type=float, default=1.0,
+                   help="λ_rep: representation-preservation weight in L_cond")
+    p.add_argument("--stage-b-lambda-div", dest="stage_b_lambda_div", type=float, default=0.1,
+                   help="λ_div: condensed-node diversity weight in L_cond")
+    p.add_argument("--stage-b-div-margin", dest="stage_b_div_margin", type=float, default=0.5,
+                   help="δ: cosine margin of the diversity hinge in L_div")
+    p.add_argument("--stage-b-tau-ret", dest="stage_b_tau_ret", type=float, default=0.1,
+                   help="Retrieval softmax temperature for L_ret distributions")
+    p.add_argument("--stage-b-tau-cov", dest="stage_b_tau_cov", type=float, default=0.1,
+                   help="τ_a: soft coverage map temperature lifting condensed→full passages")
+    p.add_argument("--stage-b-max-queries", dest="stage_b_max_queries", type=int, default=256,
+                   help="Cap on local training questions used as L_ret queries")
     p.add_argument("--hid-dim", dest="hid_dim", type=int, default=64)
     p.add_argument("--num-layers", dest="num_layers", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.0)
@@ -93,6 +140,33 @@ def _run_fl_train(argv: list[str]) -> int:
     p.add_argument("--llm-model-path", dest="llm_model_path", default="")
     p.add_argument("--llm-load-in-8bit", dest="llm_load_in_8bit", action="store_true", default=False)
     p.add_argument("--llm-load-in-4bit", dest="llm_load_in_4bit", action="store_true", default=False)
+    p.add_argument("--llm-gpu-max-memory-gib", dest="llm_gpu_max_memory_gib", type=float, default=None,
+                   help="Cap GPU VRAM device_map='auto' is allowed to use for LLM weights (GiB). "
+                        "Default: auto-detected from the GPU minus ~1.5GiB headroom.")
+    p.add_argument("--llm-cpu-max-memory-gib", dest="llm_cpu_max_memory_gib", type=float, default=None,
+                   help="Enable CPU RAM overflow for LLM weights that don't fit in --llm-gpu-max-memory-gib "
+                        "(e.g. a 7B model on an 8GB GPU) -- sets accelerate's max_memory['cpu'] budget and the "
+                        "bnb fp32-cpu-offload flag. Off by default (GPU-only; load fails loudly if it doesn't fit). "
+                        "CPU-resident layers run in fp32 on the CPU (bnb 4-bit/8-bit kernels are CUDA-only), so "
+                        "this trades a lot of speed for headroom -- expect most of a 7B model's layers to land "
+                        "here on an 8GB card, making each step dramatically slower than GPU-only.")
+    p.add_argument("--llm-frozen", dest="llm_frozen", default="True",
+                   help="'True' (default) keeps the LLM frozen -- only the GNN encoder/projector are "
+                        "federated. Set to 'False' to also LoRA-fine-tune the LLM across clients, "
+                        "aggregated each round via --lora-agg-method.")
+    p.add_argument("--lora-rank", dest="lora_rank", type=int, default=8)
+    p.add_argument("--lora-alpha", dest="lora_alpha", type=int, default=16)
+    p.add_argument("--lora-dropout", dest="lora_dropout", type=float, default=0.05)
+    p.add_argument("--lora-target-modules", dest="lora_target_modules", default=None,
+                   help="Comma-separated module names to wrap with LoRA (default: q_proj,v_proj)")
+    p.add_argument("--lora-agg-method", dest="lora_agg_method", default="fedit",
+                   choices=["fedit", "flexlora", "rolora", "flora"],
+                   help="Server-side LoRA aggregation strategy, only used when --llm-frozen False. "
+                        "fedit=plain weighted avg (baseline), flexlora=stack+SVD-compress, "
+                        "rolora=alternate A/B by round parity, flora=stack+merge into base weight "
+                        "(requires --llm-frozen False and no 4-bit/8-bit quantization).")
+    p.add_argument("--lora-agg-scale", dest="lora_agg_scale", type=float, default=2.0,
+                   help="FlexLoRA's delta_W redistribution scale factor (paper's 's')")
     p.add_argument("--llm-gradient-checkpointing", dest="llm_gradient_checkpointing",
                    action="store_true", default=False,
                    help="Enable gradient checkpointing (~4x less activation memory, allows larger batch)")
@@ -100,7 +174,7 @@ def _run_fl_train(argv: list[str]) -> int:
                    help="Max tokens to generate during eval/inference (default 16; hotpotqa answers are short)")
     p.add_argument("--eval-every", dest="eval_every", type=int, default=1, help="Run accuracy eval every N rounds (default: every round)")
     p.add_argument("--gnn-model-name", dest="gnn_model_name", default="gt")
-    p.add_argument("--gnn-model-name-c", dest="gnn_model_name_c", default="gat")
+    p.add_argument("--gnn-model-name-c", dest="gnn_model_name_c", default="gcn")
     p.add_argument("--gnn-in-dim", dest="gnn_in_dim", type=int, default=384)
     p.add_argument("--gnn-hidden-dim", dest="gnn_hidden_dim", type=int, default=384)
     p.add_argument("--gnn-num-layers", dest="gnn_num_layers", type=int, default=4)

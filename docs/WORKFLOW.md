@@ -69,7 +69,9 @@ fedcond_grag/
 ├── config.py                       # Stage D argparse (+ FL knobs)
 ├── __init__.py                     # load_client / load_server / load_task helpers
 │
-├── linearrag/                      # LinearRAG engine — used by Stage A and Stage D
+├── baselines/                      # third-party RAG methods compared against FedCondGraphRAG
+│   ├── linearrag/                  # LinearRAG engine — used by Stage A/D *and* as a standalone baseline
+│   └── hipporag/                   # per-client local HippoRAG baseline (see §11a)
 │
 ├── dataloader/                     # corpus loaders, partition, FedCondQADataset
 │   ├── fedcond_qa_dataset.py
@@ -147,7 +149,7 @@ sentence transformer and edges come from co-occurrence + LinearRAG's NER pass.
 **Code:**
 - `fedcond_grag/client/stage_a_trigraph/trigraph_builder.py` →
   `build_trigraph_for_client(passages, working_dir, dataset_name, encoder)`
-- Backed by `fedcond_grag/linearrag/LinearRAG.index(passages)`.
+- Backed by `fedcond_grag/baselines/linearrag/LinearRAG.index(passages)`.
 
 **Input:**
 | Field | Shape / Type | Notes |
@@ -229,10 +231,41 @@ preserve_sep_topology:   True                         # keep S–E + P–E patte
 
 No `node_text` is kept — anchor graphs are numeric-only by construction.
 
+**Retrieval-preserving refinement (paper B.3.5).** After the constructive
+initialization above, the condensed features X̃ are refined by minimizing
+
+```
+L_cond = L_ret + λ_rep·L_rep + λ_div·L_div
+```
+
+- `L_ret` — KL divergence between the full-graph passage-retrieval
+  distribution and the condensed one lifted back through the soft coverage
+  map `A_m(p, p̃) = softmax_p̃(cos(x_p, x̃_p̃)/τ_a)` (paper Eq. 2). Queries are
+  the client's own local training questions embedded with the same frozen
+  sentence encoder as the node features; without local questions L_ret is
+  skipped. The lifted scores are renormalized into a proper distribution so
+  the KL stays non-negative.
+- `L_rep` — soft-assignment reconstruction of sampled full-graph node
+  representations under a frozen random GNN θ⁰ shared by both graphs.
+- `L_div` — hinge on pairwise cosine similarity of condensed features
+  (margin δ), averaged over |Ṽ|² pairs.
+
+Only X̃ is optimized; the condensed topology is then rebuilt from the refined
+features via similarity kNN (paper B.3.4). Runs once per client (round 0),
+on both the fresh-condense and cached-`condensed_graph.pt` paths.
+
+**Code:** `fedcond_grag/client/stage_b_condense/condensation_refine.py`
+(`refine_condensed_graph`, `RetrievalRefineConfig`), invoked from
+`FedCondQAClient._maybe_refine_condensed`. Knobs: `--condense-refine-iters`
+(default 100; 0 disables), `--condense-refine-lr`, `--stage-b-lambda-rep`,
+`--stage-b-lambda-div`, `--stage-b-div-margin`, `--stage-b-tau-ret`,
+`--stage-b-tau-cov`, `--stage-b-max-queries`.
+
 **On disk:** `processed/<dataset>/client_<m>/condensed_graph.pt` (dict with
 `x`, `edge_index`, `edge_weight`, `node_type`).
 
-**Smoke test:** `python scripts/stage_b_smoke.py`
+**Smoke test:** `python scripts/stage_b_smoke.py`;
+refinement: `python -m pytest tests/test_stage_b_condensation_refine.py`
 
 ---
 
@@ -392,6 +425,74 @@ computes Accuracy / Hit / F1 / Precision / Recall via the legacy
 
 ---
 
+## 7a. Stage E — Query-conditioned synthetic memory adaptation (FedRAG)
+
+**Purpose:** the FedRAG algorithm's Phase 1 (paper §3.5/§3.6, Algorithm 1).
+Instead of the server refining the synthetic graph against client anchors
+every round, each client receives the full synthetic-memory parameters
+`Θ_syn = {X_syn, θ_PGE}`, adapts a **local copy** with private QA feedback,
+and uploads only the parameter delta `Δ_m`. The server aggregates deltas
+(sample-weighted) and applies one server-side regularization step:
+
+```
+Θ_syn^(r+1) = Θ_syn^(r) + η_agg · Σ_m (n_m/Σn) Δ_m − η_reg · ∇ L_reg
+```
+
+**Client-side objective** (K_mem steps per round, prompt module W frozen):
+
+```
+L_mem = L_QA + λ_gm·L_GM + λ_align·L_align + λ_reg·L_reg
+```
+
+- `L_QA` — QA loss where the condensed soft-prompt slot `z_c` comes from
+  **differentiable soft retrieval** (paper B.5.2): the pooled evidence prompt
+  rep `z̄_e` attends over projected synthetic nodes, `z_c = Σ α_i z_i^syn`,
+  so the frozen-LLM loss backpropagates into `X_syn` and `θ_PGE`. Gradients
+  reach Θ_syn without retaining the LLM graph via a context-token surrogate
+  (`(∂L/∂z_c).detach() · z_c` — exact, since Θ_syn enters only through z_c).
+- `L_GM` — first-order gradient matching (paper B.7): cosine distance between
+  the context-branch prompt-module gradients induced by synthetic vs. private
+  local evidence context.
+- `L_align` — client-local RowSoftmax alignment of the condensed anchor C_m
+  against the synthetic projections (server never sees Z_m).
+- `L_reg` — synthetic diversity + degree regularization (paper B.4.2).
+
+**Code:**
+- `fedcond_grag/client/stage_e_memory/synthetic_memory.py` —
+  `LocalSyntheticMemory`, `gradient_matching_loss`, `aggregate_syn_deltas`.
+- `fedcond_grag/client/client.py::adapt_synthetic_memory` — the K_mem loop.
+- `fedcond_grag/server/server.py::_apply_syn_deltas / _server_reg_step` —
+  Eq. (18)–(19); Phase 0 initialization reuses the repr-align path.
+- `fedcond_grag/model/dual_graph_llm.py` — `samples["z_c_soft"]` overrides the
+  condensed slot with a precomputed differentiable tensor.
+
+**Enable:** `--server-stage-c-mode fedrag` (the fl-train default). Round 0
+runs Phase 0 (repr-align init from anchors); rounds ≥ 1 run prompt tuning,
+then memory adaptation, then delta aggregation. Knobs: `--syn-mem-steps`
+(K_mem), `--syn-mem-lr`, `--syn-soft-tau`, `--lambda-gm`, `--lambda-align-mem`,
+`--lambda-reg-mem`, `--eta-agg`, `--eta-reg`, `--server-reg-steps`. Legacy
+server-side refinement remains available via
+`--server-stage-c-mode gradient_match|repr_align|both`.
+
+**Retrieval schedule (paper B.5.2):** during prompt tuning the synthetic
+context slot z_c is produced by *differentiable soft retrieval* over the
+frozen broadcast Θ_syn^(r,0) (pooled evidence prompt rep z̄_e attends over
+projected synthetic nodes) — W is optimized through the synthetic branch.
+Hard top-k retrieval over the exported synthetic graph is used only at
+eval/inference. The condensed-branch encoder defaults to **GCN** so the soft
+edge weights from the PGE carry gradient (GAT ignores scalar edge weights).
+
+**Communication schedule:** the anchor C_m is uploaded exactly once (Phase 0,
+first round the client participates); every later round carries only
+`{W_m, Δ_m}`. The server treats anchor-less rounds as normal in fedrag mode.
+
+**Privacy scope:** the upload is `{W_m, Δ_m}` plus the one-time anchor C_m —
+no queries, answers, evidence graphs, or retrieval traces leave the client.
+
+**Test:** `python -m pytest tests/test_stage_e_synthetic_memory.py`
+
+---
+
 ## 8. Federated round loop
 
 `fedcond_grag/trainer.py::FedTrainer` is the round-loop driver:
@@ -417,6 +518,33 @@ The trainer is intentionally lean (~110 lines) — no algorithm dispatch, no
 gfl-style task registry, no wandb-table communication accounting. Add those
 back if needed; they're not load-bearing for correctness.
 
+### 8a. Federated LoRA aggregation baselines (`fedcond_grag/server/lora_aggregate/`)
+
+By default (`--llm-frozen True`) Stage D only federates the GNN encoder +
+projector — the LLM backbone never trains, so there's nothing to aggregate
+for it. Passing `--llm-frozen False` turns on local LoRA fine-tuning of the
+LLM (`fedcond_grag/model/graph_llm.py`'s existing peft `LoraConfig` branch)
+on top of the usual GNN federation, and `--lora-agg-method` picks how the
+server combines every sampled client's LoRA adapter each round. Ported from
+FedLLM-Factory (https://github.com/boyi-liu/FedLLM-Factory, `alg/*.py`):
+
+| `--lora-agg-method` | Idea |
+|---|---|
+| `fedit` (default) | Plain weighted average of `lora_A`/`lora_B` independently — the naive baseline every federated-LoRA paper compares against; averaging A and B separately only approximates averaging the true update `B@A`. |
+| `flexlora` | Stack each client's (data-weighted) A/B along the rank axis, form the *exact* summed update `delta_W = B_stack @ A_stack`, SVD-truncate back to `--lora-rank` so the adapter shape is unchanged. |
+| `rolora` | Alternates which half is trainable/aggregated by round parity (odd rounds: `lora_B`, even: `lora_A`) instead of touching both every round — avoids compounding FedIT's averaging error. |
+| `flora` | Same exact-sum reconstruction as `flexlora`, but merges it straight into the frozen base weight and resets every client to the same fixed initial adapter next round, so successive rounds compose into a full-rank backbone change. **Requires `--llm-frozen False` and no `--llm-load-in-4bit`/`--llm-load-in-8bit`** — merging into a quantized `Params4bit`/`Int8Params` base weight isn't supported (raises `RuntimeError`). |
+
+```bash
+python main.py fl-train --dataset hotpotqa --num-clients 5 --num-rounds 10 \
+    --llm-frozen False --lora-agg-method flexlora --lora-rank 8
+```
+
+Related flags: `--lora-rank`, `--lora-alpha`, `--lora-dropout`,
+`--lora-target-modules` (comma-separated, default `q_proj,v_proj`) configure
+the LoRA adapter itself; `--lora-agg-scale` is FlexLoRA's redistribution
+factor (paper's `s`). See `fedcond_grag/server/lora_aggregate/__init__.py`.
+
 ---
 
 ## 9. CLI reference
@@ -431,6 +559,10 @@ python main.py preprocess --dataset hotpotqa --clients 0 1 2 --force
 
 # Federated round loop (Stage C aggregation; Stage B happens inside the client)
 python main.py fl-train --dataset hotpotqa --num-clients 5 --num-rounds 1
+
+# ...with federated LoRA fine-tuning of the LLM too (see §8a)
+python main.py fl-train --dataset hotpotqa --num-clients 5 --num-rounds 10 \
+    --llm-frozen False --lora-agg-method flexlora
 
 # Stage D — centralized fit on the cached FedCondQA dataset
 python main.py train \
@@ -484,6 +616,14 @@ G-Retriever/
 **Supported datasets** (`scripts/preprocess_data.py --dataset …`):
 `hotpotqa`, `2wikimultihop`, `musique`, `medical`.
 
+`hotpotqa`, `musique`, `2wikimultihop` are our primary evaluation benchmarks,
+populated by `scripts/setup_datasets.py`. It pulls the standard 1000-question
+dev split + full retrieval corpus for each (sourced from the copies checked
+into [OSU-NLP-Group/HippoRAG](https://github.com/OSU-NLP-Group/HippoRAG)'s
+`reproduce/dataset/`, not a fresh HuggingFace re-sample) so results stay
+comparable across systems evaluated on the same benchmark. Raw files are
+cached under `dataset/raw/`.
+
 ---
 
 ## 11. End-to-end run, 5 clients, hotpotqa
@@ -512,6 +652,140 @@ python main.py train \
 # 6. Inspect the metric printed at the end of train, or re-run inference:
 python main.py infer \
     --dataset fedcond_qa --model_name dual_graph_llm --seed 0
+```
+
+---
+
+## 11a. Baselines (`fedcond_grag/baselines/`)
+
+Third-party RAG methods evaluated against FedCondGraphRAG for comparison
+live here, one subpackage per method. Each subpackage vendors or
+pip-installs the method's own code unmodified and adds only a thin
+per-client runner -- the point is a fair, reused-not-reimplemented baseline,
+not a reimplementation of the method.
+
+**`linearrag/`** -- the LinearRAG engine (NER, embedding store, PPR retrieval).
+Dual-purpose: Stage A (`trigraph_builder.py`) and Stage D
+(`linearrag_retriever.py`, `evidence_linearrag.py`) import it as the tri-graph
+backend, and it also stands on its own as a baseline (plain LinearRAG
+retrieval, no federated condensation) -- there's no dedicated per-client
+runner script for it yet (unlike `hipporag/` below).
+
+**`hipporag/`** -- per-client local HippoRAG (https://github.com/OSU-NLP-Group/HippoRAG):
+```
+fedcond_grag/baselines/hipporag/
+└── client_runner.py     # builds each client's local corpus shard from dataset/raw/<name>_corpus.json
+                          # (same idx % num_clients rule as preprocess_data.py), runs HippoRAG.index()
+                          # + rag_qa() on that shard alone, evaluated against the *global* question set
+```
+
+A real pip dependency (installed straight from upstream's GitHub `main`,
+pinned to a commit SHA -- see `requirements.txt`), not vendored.
+
+This measures what happens to a traditional single-node graph-RAG method
+when its corpus is fragmented across clients that can't see each other's
+passages: each client answers the full benchmark test set using only its
+own shard, so multi-hop questions whose evidence spans multiple clients are
+expected to fail for most clients. That gap is the comparison point against
+FedCondGraphRAG's federated retrieval.
+
+Requires an OpenAI-compatible LLM endpoint (default: local Ollama at
+`http://localhost:11434/v1`) for OpenIE + QA, and an embedding model
+(default: `Transformers/sentence-transformers/all-MiniLM-L6-v2`, matching
+the encoder used everywhere else in this repo).
+
+```bash
+# one-time: start a local OpenAI-compatible LLM server
+ollama serve &
+ollama pull qwen2.5:7b-instruct
+
+# run every client, all 3 datasets
+python scripts/run_hipporag_baseline.py --dataset all --num_clients 5
+
+# just one client (e.g. to sanity-check before a full run)
+python scripts/run_hipporag_baseline.py --dataset hotpotqa --client 0 --num_clients 5
+```
+
+Output: `%LOCALAPPDATA%/fedrag_baselines/hipporag/<dataset>/client_<m>/`
+(HippoRAG's own index + OpenIE cache) and
+`.../hipporag/<dataset>/summary.json` (per-client + mean recall@k / EM / F1
+across clients). This is deliberately *not* under the repo -- HippoRAG's
+OpenAI response cache uses `filelock.FileLock`, which fails on Windows over
+a UNC/network path (this repo may live at `\\wsl.localhost\...`); override
+with `--save_root` to change it.
+
+**`gretriever/`** -- per-client local G-Retriever
+(https://github.com/XiaoxinHe/G-Retriever). Not vendored: this project's own
+`fedcond_grag/model/graph_llm.py` / `gnn.py` already *are* a fork of
+G-Retriever's model (same GraphLLM class, same GCN/GraphTransformer/GAT
+encoders, same BOS/EOS_USER/EOS prompt scheme). `client_runner.py` just
+drives that existing model in single-client, non-federated mode: one client
+trains + evaluates a fresh `GraphLLM` on its own Tri-Graph shard (built by
+Stage A) with its own local PPR evidence retrieval, no Stage B/C, no
+cross-client sharing.
+
+```bash
+python scripts/run_gretriever_baseline.py --dataset hotpotqa --num_clients 5
+python scripts/run_gretriever_baseline.py --dataset hotpotqa --client 0 --num_clients 5
+```
+
+**`grag/`** -- per-client local GRAG (https://github.com/HuieL/GRAG). GRAG is
+built on G-Retriever but its GNN is genuinely different (query-conditioned
+node/edge features: `graph_encoder(x, edge_index, question_node, edge_attr,
+question_edge)`), so unlike `gretriever/` it can't reuse this project's
+existing model -- `model/gnn.py` + `model/graph_llm.py` and the retrieval
+algorithm (`utils/graph_retrieval.py`, `utils/text_graph.py`) are vendored
+under `_vendor/` (MIT licensed, see `_vendor/VENDORED.md` for the handful of
+hardcoded-dimension / eager-import deviations needed to run it here).
+
+GRAG's own method expects a real knowledge graph (subject --relation-->
+object triples, e.g. from WebQSP), which this project's text-corpus
+benchmarks don't have. `client_runner.py` builds one per client, preferring
+`baselines/hipporag`'s cached OpenIE triples when that baseline has already
+been run for the same dataset/client (reused as-is -- no reason to pay for
+the LLM extraction twice), and otherwise falling back to this project's own
+Tri-Graph with generic per-edge-type labels ("mentions"/"contains") standing
+in for real relations.
+
+```bash
+python scripts/run_grag_baseline.py --dataset hotpotqa --num_clients 5
+python scripts/run_grag_baseline.py --dataset hotpotqa --client 0 --num_clients 5
+```
+
+**`flare/`** -- per-client local FLARE (https://github.com/jzbjyb/FLARE).
+Training-free, unlike the other three: FLARE iteratively generates a
+temporary look-ahead continuation of the answer, decides whether to
+retrieve by checking for low-confidence tokens (masking them to form the
+query), and regenerates conditioned on what's retrieved -- repeated
+sentence-by-sentence. Only the confidence-masking logic itself
+(`ApiReturn`) is vendored under `_vendor/`; FLARE's own orchestration loop
+is tightly coupled to the legacy OpenAI completions API (the only path in
+their code that returns per-token logprobs -- verified empirically that
+Ollama's `/v1/completions` doesn't return them, but `/v1/chat/completions`
+does), an Elasticsearch+Wikipedia retriever, and dataset templates that
+don't cover HotpotQA/MuSiQue, so `client_runner.py` reimplements the loop
+against this project's own per-client corpus and local Ollama chat
+completions (see `_vendor/VENDORED.md` for the full reasoning).
+
+```bash
+python scripts/run_flare_baseline.py --dataset hotpotqa --num_clients 5
+python scripts/run_flare_baseline.py --dataset hotpotqa --client 0 --num_clients 5
+```
+
+**`comorag/`** -- per-client local ComoRAG
+(https://github.com/EternityJune25/ComoRAG). Itself a fork of HippoRAG
+(many files byte-identical to what `baselines/hipporag` uses) that adds a
+"veridical / semantic / episodic" memory-pool retrieval loop on top --
+iterative reasoning cycles that probe a shared memory pool and consolidate
+newly retrieved evidence with what's already known, aimed at long-narrative
+reasoning. Not pip-installable upstream, vendored under `_vendor/` (see
+`_vendor/VENDORED.md` for the HippoRAG lineage and five packaging/bugfix
+deviations, including a genuine upstream `EmbeddingStore` initialization
+bug found and fixed via smoke testing).
+
+```bash
+python scripts/run_comorag_baseline.py --dataset hotpotqa --num_clients 5
+python scripts/run_comorag_baseline.py --dataset hotpotqa --client 0 --num_clients 5
 ```
 
 ---

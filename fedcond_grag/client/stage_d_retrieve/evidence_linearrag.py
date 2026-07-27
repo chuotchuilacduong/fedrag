@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from fedcond_grag.linearrag import LinearRAG, LinearRAGConfig
+from fedcond_grag.baselines.linearrag import LinearRAG, LinearRAGConfig
 from fedcond_grag.client.stage_a_trigraph.node_encoder import DEFAULT_MODEL, load_encoder
 from fedcond_grag.client.stage_d_retrieve.linearrag_retriever import LinearRAGRetriever
 

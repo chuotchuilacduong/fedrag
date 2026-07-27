@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from fedcond_grag.linearrag.ner import SpacyNER
+from fedcond_grag.baselines.linearrag.ner import SpacyNER
 
 
 class EntityExtractor:

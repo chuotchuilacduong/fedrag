@@ -138,6 +138,8 @@ class FedTrainer:
 
             client_losses: dict[int, float] = {}
             client_times: dict[int, float] = {}
+            client_syn_mem: dict[int, float] = {}
+            stage_b_refine: dict[int, dict] = {}
             for cid in sampled:
                 t0 = time.perf_counter()
                 self.clients[cid].receive_message()
@@ -154,6 +156,25 @@ class FedTrainer:
                     global_step += steps
                     client_losses[cid] = loss
 
+                    # FedRAG Phase 1: query-conditioned synthetic-memory
+                    # adaptation — client refines a local copy of Θ_syn and
+                    # uploads only the delta.
+                    if str(getattr(self.args, "server_stage_c_mode", "")) == "fedrag":
+                        mem_loss = self.clients[cid].adapt_synthetic_memory()
+                        if mem_loss is not None:
+                            client_syn_mem[cid] = mem_loss
+                            print(
+                                f"    [client_{cid}] syn-mem adapted | "
+                                f"qa(syn) {mem_loss:.4f}",
+                                flush=True,
+                            )
+
+                # Stage B refinement stats (Phase 0) — consumed once per client
+                refine_stats = getattr(self.clients[cid], "last_stage_b_refine", None)
+                if refine_stats:
+                    stage_b_refine[cid] = refine_stats
+                    self.clients[cid].last_stage_b_refine = None
+
                 self.clients[cid].send_message()
                 client_times[cid] = time.perf_counter() - t0
                 loss_str = f" | loss: {loss:.4f}" if round_id >= 1 else ""
@@ -168,7 +189,9 @@ class FedTrainer:
             val_metrics = test_metrics = None
             eval_time = None
             eval_every = int(getattr(self.args, "eval_every", 1))
-            do_eval = round_id >= 1 and self.shared_model is not None and (round_id % eval_every == 0)
+            # Round 0 eval gives the Phase-0 baseline point (untrained prompt
+            # module) so wandb charts include the initialization round.
+            do_eval = self.shared_model is not None and (round_id % eval_every == 0)
             if do_eval:
                 t_eval = time.perf_counter()
                 if self._val_samples:
@@ -188,10 +211,14 @@ class FedTrainer:
             avg_loss = (
                 sum(client_losses.values()) / len(client_losses) if client_losses else None
             )
+            server_syn_loss = getattr(self.server, "train_loss_match", None)
             metrics = {
                 "round": round_id,
                 "avg_loss": avg_loss,
                 "client_losses": dict(client_losses),
+                "client_syn_mem": dict(client_syn_mem),
+                "stage_b_refine": dict(stage_b_refine),
+                "server_syn_loss": server_syn_loss,
                 "client_times": dict(client_times),
                 "round_time": round_time,
                 "agg_time": agg_time,
@@ -275,6 +302,14 @@ class FedTrainer:
             log["round/avg_loss"] = metrics["avg_loss"]
             for cid, loss in metrics["client_losses"].items():
                 log[f"round/client_{cid}_loss"] = loss
+        # Phase 0 / synthetic-memory diagnostics
+        if metrics.get("server_syn_loss") is not None:
+            log["round/server_syn_loss"] = metrics["server_syn_loss"]
+        for cid, loss in metrics.get("client_syn_mem", {}).items():
+            log[f"round/client_{cid}_syn_mem_qa"] = loss
+        for cid, h in metrics.get("stage_b_refine", {}).items():
+            log[f"round/client_{cid}_Lcond_start"] = h["l_cond_start"]
+            log[f"round/client_{cid}_Lcond_end"] = h["l_cond_end"]
         # Accuracy per round
         if metrics["train_acc"] is not None:
             log["round/train_acc"] = metrics["train_acc"]
@@ -306,17 +341,17 @@ class FedTrainer:
         hdr += f" {'Train%':>7} | {'Val%':>7} | {'Test%':>7}"
         print(hdr)
         print("-" * W)
+        def _f(v):
+            return f"{v:>6.1f}%" if v is not None else f"{'N/A':>7}"
+
         for m in round_metrics:
             if m["avg_loss"] is None:
-                print(f"{m['round']:>4} | {'(boot)':>8} |" + f" {'—':>8} |" * n +
-                      f" {'—':>7} | {'—':>7} | {'—':>7}")
-                continue
-            row = f"{m['round']:>4} | {m['avg_loss']:>8.4f} |"
-            for cid in range(n):
-                v = m["client_losses"].get(cid, float("nan"))
-                row += f" {v:>8.4f} |"
-            def _f(v):
-                return f"{v:>6.1f}%" if v is not None else f"{'N/A':>7}"
+                row = f"{m['round']:>4} | {'(boot)':>8} |" + f" {'—':>8} |" * n
+            else:
+                row = f"{m['round']:>4} | {m['avg_loss']:>8.4f} |"
+                for cid in range(n):
+                    v = m["client_losses"].get(cid, float("nan"))
+                    row += f" {v:>8.4f} |"
             row += f" {_f(m['train_acc'])} | {_f(m['val_acc'])} | {_f(m['test_acc'])}"
             print(row)
         print("=" * W)
@@ -425,7 +460,7 @@ class FedTrainer:
 
         self.args.llm_model_path = llm_path
         for attr, default in (
-            ("gnn_model_name",   "gt"),   ("gnn_model_name_c",  "gat"),
+            ("gnn_model_name",   "gt"),   ("gnn_model_name_c",  "gcn"),
             ("gnn_num_layers",   4),      ("gnn_num_layers_c",  None),
             ("gnn_in_dim",       384),    ("gnn_in_dim_c",      None),
             ("gnn_hidden_dim",   384),    ("gnn_hidden_dim_c",  None),
@@ -433,6 +468,10 @@ class FedTrainer:
             ("gnn_dropout",      0.0),    ("dual_graph_mode",   "shared"),
             ("max_txt_len",      512),    ("max_new_tokens",    32),
             ("llm_frozen",       "True"),
+            ("lora_rank",        8),      ("lora_alpha",        16),
+            ("lora_dropout",     0.05),   ("lora_target_modules", None),
+            ("lora_agg_method",  "fedit"), ("lora_agg_scale",   2.0),
+            ("llm_gpu_max_memory_gib", None), ("llm_cpu_max_memory_gib", None),
         ):
             if not hasattr(self.args, attr):
                 setattr(self.args, attr, default)
@@ -444,9 +483,10 @@ class FedTrainer:
             return
 
         for name, param in model.named_parameters():
-            param.requires_grad = any(
-                name.startswith(k) for k in
-                ("graph_encoder", "projector", "condensed_encoder", "projector_c")
+            param.requires_grad = (
+                any(name.startswith(k) for k in
+                    ("graph_encoder", "projector", "condensed_encoder", "projector_c"))
+                or ".lora_A." in name or ".lora_B." in name
             )
 
         if not hasattr(model, "hf_device_map"):
@@ -455,6 +495,7 @@ class FedTrainer:
 
         for client in self.clients:
             client.set_shared_model(model)
+        self.server.set_shared_llm_model(model.model)
 
         print(f"[FedTrainer] Stage D ready — shared DualGraphLLM on {self.device}")
 

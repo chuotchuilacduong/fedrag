@@ -32,6 +32,26 @@ TOP_K_DESC = 5          # passages to include in LLM desc
 ENCODE_BATCH = 512
 
 
+def _passage_text_from_evidence_item(item) -> str | None:
+    """Best-effort passage text extraction across the evidence schemas actually
+    present in dataset/linearrag/*/questions.json:
+      - HotpotQA-style pair:  [title, [sentence, ...]]
+      - KG triple (2wikimultihop): [subject, relation, object]
+      - plain sentence (medical):  "sentence text"
+    Returns None if the item can't be turned into text (caller skips it).
+    """
+    if isinstance(item, str):
+        text = item.strip()
+        return text or None
+    if isinstance(item, (list, tuple)) and item:
+        if len(item) == 2 and isinstance(item[1], (list, tuple)):
+            title, sentences = item
+            return f"{title}: {' '.join(str(s).strip() for s in sentences[:3])}"
+        if all(isinstance(x, str) for x in item):
+            return " ".join(str(x).strip() for x in item)
+    return None
+
+
 def _collect_passages(questions: list[dict]) -> tuple[list[list[str]], list[str]]:
     """Return per-question passage lists and deduplicated unique passage list."""
     seen: dict[str, int] = {}
@@ -39,8 +59,13 @@ def _collect_passages(questions: list[dict]) -> tuple[list[list[str]], list[str]
     per_q: list[list[str]] = []
     for q in questions:
         plist: list[str] = []
-        for title, sentences in q.get("evidence", []):
-            text = f"{title}: {' '.join(str(s).strip() for s in sentences[:3])}"
+        evidence = q.get("evidence") or []
+        if isinstance(evidence, str):
+            evidence = [evidence] if evidence.strip() else []
+        for item in evidence:
+            text = _passage_text_from_evidence_item(item)
+            if not text:
+                continue
             plist.append(text)
             if text not in seen:
                 seen[text] = len(unique)

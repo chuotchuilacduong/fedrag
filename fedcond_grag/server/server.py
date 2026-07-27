@@ -30,6 +30,7 @@ from fedcond_grag.server.stage_c_aggregate.surrogate import (
     parameter_gradients,
     surrogate_loss,
 )
+from fedcond_grag.server.lora_aggregate import build_lora_aggregator, has_lora, lora_state_dict
 
 
 @dataclass
@@ -66,6 +67,7 @@ class FedCondQAServer:
         self.synthetic_x: nn.Parameter | None = None
         self.synthetic_node_type: Tensor | None = None
         self.pge: TypeAwarePGE | None = None
+        self._pge_config: dict | None = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.best_loss = float("inf")
         self.best_state: SyntheticGraphState | None = None
@@ -76,6 +78,26 @@ class FedCondQAServer:
         self.repr_projector: nn.Module | None = None
         self._build_repr_encoder()
         self.task.override_evaluate = self.get_override_evaluate()
+
+        # Federated LoRA aggregation (Stage D, only active when --llm-frozen
+        # False). shared_llm_model/global_lora are populated by
+        # set_shared_llm_model() once FedTrainer builds the Stage D model.
+        self.lora_agg = build_lora_aggregator(
+            getattr(args, "lora_agg_method", "fedit"),
+            rank=int(getattr(args, "lora_rank", 8)),
+            scale=float(getattr(args, "lora_agg_scale", 2.0)),
+        )
+        self.global_lora: dict | None = None
+        self.shared_llm_model = None
+
+    def set_shared_llm_model(self, model) -> None:
+        """Register the shared PEFT-wrapped LLM (DualGraphLLM.model) so LoRA
+        aggregation strategies can read/merge its weights. Called once by
+        FedTrainer after the Stage D model is constructed; a no-op
+        (global_lora stays None) unless LoRA is actually enabled."""
+        self.shared_llm_model = model
+        if has_lora(model):
+            self.global_lora = lora_state_dict(model)
 
     def send_message(self):
         if self.synthetic_x is None or self.synthetic_node_type is None or self.pge is None:
@@ -89,6 +111,17 @@ class FedCondQAServer:
             "synthetic_node_type": self.synthetic_node_type.detach(),
             "synthetic_graph": self.export_synthetic_graph(),
         }
+        if self._pge_config is not None:
+            # Θ_syn broadcast for client-side query-conditioned adaptation
+            msg["synthetic_state"] = {
+                "x": self.synthetic_x.detach().clone(),
+                "node_type": self.synthetic_node_type.detach().clone(),
+                "pge_state": {
+                    k: v.detach().clone() for k, v in self.pge.state_dict().items()
+                },
+                "pge_config": dict(self._pge_config),
+                "target_degree": float(self._target_anchor_degree),
+            }
         if self.global_model_state:
             msg["model_weights"] = self.global_model_state
         self.message_pool["server"] = msg
@@ -96,21 +129,43 @@ class FedCondQAServer:
     def execute(self):
         start = time.perf_counter()
         anchor_graphs = self._collect_anchor_graphs()
-        if not anchor_graphs:
+        mode = str(getattr(self.args, "server_stage_c_mode", "gradient_match"))
+        # fedrag clients upload G̃_m only once (Phase 0); later rounds carry
+        # synthetic-memory deltas instead, so an anchor-less round is normal.
+        if not anchor_graphs and mode != "fedrag":
             return
 
         if self.synthetic_x is None or self.synthetic_node_type is None or self.pge is None:
+            if not anchor_graphs:
+                return
             self.init_synthetic_graph(anchor_graphs)
-
-        mode = str(getattr(self.args, "server_stage_c_mode", "gradient_match"))
 
         num_steps = int(getattr(self.args, "server_condense_iters", 50))
         last_loss = None
 
-        if self.global_model_state and mode in ("repr_align", "both"):
+        if self.global_model_state and mode in ("repr_align", "both", "fedrag"):
             self._load_repr_align_weights(self.global_model_state)
 
-        if mode == "gradient_match":
+        if mode == "fedrag":
+            # FedRAG federated optimization (paper §3.6): Phase 0 initializes
+            # the synthetic memory from client anchors via L_align + L_reg;
+            # from round 1 onward the server only aggregates client-side
+            # synthetic-memory deltas and applies its own L_reg step —
+            # it never optimizes against client-condensed representations.
+            delta_entries = self._collect_syn_deltas()
+            if delta_entries:
+                last_loss = self._apply_syn_deltas(delta_entries)
+            elif anchor_graphs:
+                # Phase 0: L_init_syn = L_align + L_reg against the one-time
+                # client anchor uploads.
+                self._target_anchor_degree = compute_target_degree(anchor_graphs)
+                anchor_h_list = precompute_anchor_reprs(
+                    anchor_graphs, self.repr_encoder, self.repr_projector, self.device
+                )
+                for _ in range(max(1, num_steps)):
+                    last_loss = self.server_repr_align_step(anchor_h_list)
+
+        elif mode == "gradient_match":
             anchor_gradients = self.compute_anchor_gradients(anchor_graphs)
             for _ in range(max(1, num_steps)):
                 last_loss = self.server_condense_step(anchor_gradients)
@@ -184,6 +239,13 @@ class FedCondQAServer:
             topk=int(getattr(self.args, "pge_topk", 8)),
             preserve_sep=bool(getattr(self.args, "preserve_sep_topology", True)),
         ).to(self.device)
+        self._pge_config = {
+            "feature_dim": feature_dim,
+            "hidden_dim": int(getattr(self.args, "pge_hidden", 256)),
+            "type_emb_dim": int(getattr(self.args, "type_emb_dim", 16)),
+            "topk": int(getattr(self.args, "pge_topk", 8)),
+            "preserve_sep": bool(getattr(self.args, "preserve_sep_topology", True)),
+        }
         self.optimizer = torch.optim.Adam(
             [self.synthetic_x, *self.pge.parameters()],
             lr=float(getattr(self.args, "lr_feat", 1e-2)),
@@ -363,18 +425,92 @@ class FedCondQAServer:
         self._update_best_state(loss)
         return loss
 
+    # ------------------------------------------------------------------
+    # FedRAG synthetic-memory refinement (paper §3.6, Eq. 18–19)
+    # ------------------------------------------------------------------
+
+    def _collect_syn_deltas(self) -> list[tuple[dict, int]]:
+        """Gather (Δ_m, n_m) synthetic-memory updates from sampled clients."""
+        entries: list[tuple[dict, int]] = []
+        for client_id in self.message_pool.get("sampled_clients", []):
+            msg = self.message_pool.get(f"client_{client_id}", {})
+            delta = msg.get("syn_delta")
+            n = int(msg.get("num_samples", 0))
+            if delta is not None and n > 0:
+                entries.append((delta, n))
+        return entries
+
+    def _apply_syn_deltas(self, entries: list[tuple[dict, int]]) -> Tensor | None:
+        """Θ_syn^(r+1) = Θ_syn^(r) + η_agg·Δ^(r) − η_reg·∇_Θ L_reg (Eq. 19)."""
+        from fedcond_grag.client.stage_e_memory import aggregate_syn_deltas
+
+        delta = aggregate_syn_deltas(entries)
+        if delta is None:
+            return None
+
+        eta_agg = float(getattr(self.args, "eta_agg", 1.0))
+        with torch.no_grad():
+            self.synthetic_x.add_(eta_agg * delta["x"].to(self.synthetic_x.device))
+            pge_sd = self.pge.state_dict()
+            for key, value in pge_sd.items():
+                d = delta["pge"].get(key)
+                if d is not None:
+                    pge_sd[key] = value + eta_agg * d.to(
+                        device=value.device, dtype=value.dtype
+                    )
+            self.pge.load_state_dict(pge_sd)
+
+        last = None
+        reg_steps = int(getattr(self.args, "server_reg_steps", 1))
+        eta_reg = float(getattr(self.args, "eta_reg", 1e-2))
+        for _ in range(max(0, reg_steps)):
+            last = self._server_reg_step(eta_reg)
+        return last
+
+    def _server_reg_step(self, eta_reg: float) -> Tensor:
+        """One plain gradient step on L_reg = λ_synDiv·L_synDiv + λ_deg·L_deg.
+
+        Computed on the server only — it depends solely on the synthetic graph
+        (paper B.4.2), never on client data.
+        """
+        adj_soft = self.pge(self.synthetic_x, self.synthetic_node_type, sparsify=False)
+        rows, cols = (adj_soft.detach() > 0).nonzero(as_tuple=True)
+        edge_index = torch.stack([rows, cols], dim=0).long()
+        edge_weight = adj_soft[rows, cols]
+        h_syn = encode_nodes_with_edge_weight(
+            self.synthetic_x, edge_index, edge_weight,
+            self.repr_encoder, self.repr_projector,
+        )
+        loss = (
+            float(getattr(self.args, "lambda_div", 0.1)) * diversity_loss(h_syn)
+            + float(getattr(self.args, "lambda_deg", 0.05))
+            * degree_regularization(adj_soft, self._target_anchor_degree)
+        )
+        params = [self.synthetic_x, *self.pge.parameters()]
+        grads = torch.autograd.grad(loss, params, allow_unused=True)
+        with torch.no_grad():
+            for param, grad in zip(params, grads):
+                if grad is not None:
+                    param.sub_(eta_reg * grad)
+        return loss.detach()
+
     def _fedavg_model_weights(self) -> None:
-        """FedAvg GNN encoder + projector weights from sampled clients."""
+        """FedAvg GNN encoder + projector weights from sampled clients, plus
+        LoRA adapter aggregation (via self.lora_agg) when Stage D LoRA
+        fine-tuning is enabled."""
         sampled = self.message_pool.get("sampled_clients", [])
         _WEIGHT_KEYS = ("graph_encoder", "projector", "condensed_encoder", "projector_c")
 
         client_entries: list[tuple[dict, int]] = []
+        lora_entries: list[tuple[dict, int]] = []
         for cid in sampled:
             msg = self.message_pool.get(f"client_{cid}", {})
             weights = msg.get("model_weights")
             n = int(msg.get("num_samples", 0))
             if weights and n > 0:
                 client_entries.append((weights, n))
+                if "lora" in weights:
+                    lora_entries.append((weights["lora"], n))
 
         if not client_entries:
             return
@@ -391,6 +527,16 @@ class FedCondQAServer:
                     sd[param_name].float() * (n / total) for sd, n in entries
                 )
             aggregated[key] = avg
+
+        if lora_entries and self.global_lora is not None:
+            client_loras = [d for d, _ in lora_entries]
+            client_weights = [float(n) for _, n in lora_entries]
+            round_id = int(self.message_pool.get("round", 0))
+            self.global_lora = self.lora_agg.aggregate(
+                client_loras, client_weights, self.global_lora, round_id,
+                model=self.shared_llm_model,
+            )
+            aggregated["lora"] = self.global_lora
 
         self.global_model_state = aggregated
         if aggregated:
@@ -415,7 +561,7 @@ class FedCondQAServer:
         load_gnn_model = _gnn_mod.load_gnn_model
 
         args = self.args
-        gnn_name = getattr(args, "gnn_model_name_c", getattr(args, "gnn_model_name", "gat"))
+        gnn_name = getattr(args, "gnn_model_name_c", getattr(args, "gnn_model_name", "gcn"))
         num_layers = getattr(args, "gnn_num_layers_c", None) or getattr(args, "gnn_num_layers", 2)
         num_heads = getattr(args, "gnn_num_heads_c", None) or getattr(args, "gnn_num_heads", 4)
         hidden_dim = getattr(args, "gnn_hidden_dim_c", None) or getattr(args, "gnn_hidden_dim", 1024)
