@@ -27,7 +27,7 @@ sys.path.insert(0, str(_ROOT))
 
 import torch
 
-ENCODER_MODEL = "all-MiniLM-L6-v2"
+from fedcond_grag.constants import ENCODER_MODEL  # noqa: E402
 TOP_K_DESC = 5          # passages to include in LLM desc
 ENCODE_BATCH = 512
 
@@ -80,10 +80,16 @@ def main() -> None:
                         choices=["hotpotqa", "musique", "2wikimultihop", "medical"])
     parser.add_argument("--top-k-desc", type=int, default=TOP_K_DESC,
                         help="Number of cosine-ranked passages to use as LLM desc")
+    parser.add_argument("--out-root", default="dataset/fedcond_qa",
+                        help="Output root for the QA cache. Use a per-dataset dir "
+                             "(e.g. dataset/fedcond_qa_musique) when working with "
+                             "several datasets so they don't overwrite each other; "
+                             "pass the same path to fl-train via --qa-data-root.")
     args = parser.parse_args()
 
     processed_root = _ROOT / "processed" / args.dataset
-    out_root = _ROOT / "dataset" / "fedcond_qa"
+    out_root = (_ROOT / args.out_root) if not Path(args.out_root).is_absolute() \
+        else Path(args.out_root)
 
     from sentence_transformers import SentenceTransformer
 
@@ -178,6 +184,12 @@ def main() -> None:
         for r in records:
             f.write(json.dumps(r) + "\n")
     print(f"  records.jsonl: {len(records)} records")
+
+    # Stamp which --dataset this cache was built from. dataset/fedcond_qa is a
+    # shared path across datasets by default, so callers (main.py preprocess)
+    # need a way to detect a stale cache from a *different* dataset before
+    # deciding to skip a rebuild.
+    (out_root / "_meta.json").write_text(json.dumps({"dataset": args.dataset}))
 
     # ------------------------------------------------------------------
     # 4. Train / val / test splits  (80 / 10 / 10)

@@ -37,7 +37,7 @@ from fedcond_grag.client.stage_d_retrieve.evidence_linearrag import EvidenceLine
 
 LINEARRAG_ROOT = _ROOT / "dataset" / "linearrag"
 PROCESSED_ROOT = _ROOT / "processed"
-ENCODER_MODEL = "all-MiniLM-L6-v2"
+from fedcond_grag.constants import ENCODER_MODEL  # noqa: E402
 _PREFIX_RE = re.compile(r"^\d+:")
 
 

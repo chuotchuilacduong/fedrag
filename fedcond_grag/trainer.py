@@ -24,6 +24,7 @@ from pathlib import Path
 import torch
 
 from fedcond_grag.client.client import FedCondQAClient
+from fedcond_grag.constants import ENCODER_DIM
 from fedcond_grag.server.server import FedCondQAServer
 from fedcond_grag.utils.evaluate import exact_match, normalize, token_f1
 
@@ -543,7 +544,19 @@ class FedTrainer:
         return data, str(client_dir)
 
     def _load_global_data(self):
+        """The server only needs the node-feature dimensionality — hand it a
+        1-node stub instead of duplicating a client's raw trigraph (multi-GB,
+        and the server must never hold private client graphs)."""
+        from torch_geometric.data import Data
+
         global_dir = self._processed_root() / "global"
         global_dir.mkdir(parents=True, exist_ok=True)
-        data, _ = self._load_client_data(0)
-        return data, str(global_dir)
+        feat_dim = int(self.clients[0].tri_graph.x.size(1)) if self.clients else ENCODER_DIM
+        stub = Data(
+            x=torch.zeros(1, feat_dim),
+            edge_index=torch.zeros(2, 0, dtype=torch.long),
+            node_type=torch.zeros(1, dtype=torch.long),
+        )
+        stub.y = stub.node_type.long()
+        stub.num_global_classes = 3
+        return stub, str(global_dir)

@@ -25,6 +25,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from fedcond_grag.constants import ENCODER_MODEL_HF  # noqa: E402
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
@@ -135,7 +139,7 @@ def main() -> int:
     parser.add_argument("--qa-root", default="dataset/fedcond_qa")
     parser.add_argument("--processed-root", default="processed/hotpotqa")
     parser.add_argument("--num-clients", type=int, default=5)
-    parser.add_argument("--encoder", default="sentence-transformers/all-MiniLM-L6-v2")
+    parser.add_argument("--encoder", default=ENCODER_MODEL_HF)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--skip-embs", action="store_true", help="Skip passage embedding build")

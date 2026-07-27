@@ -13,6 +13,7 @@ from torch import nn
 from torch.nn.utils import clip_grad_norm_
 from torch_geometric.data import Data
 
+from fedcond_grag.constants import ENCODER_DIM, ENCODER_MODEL
 from fedcond_grag.server.stage_c_aggregate.task import CondensationQATask
 from fedcond_grag.server.lora_aggregate import has_lora, lora_state_dict
 from fedcond_grag.client.stage_b_condense import ClientCondensationConfig, ClientCondensor, AnchorSelectorConfig
@@ -723,12 +724,12 @@ class FedCondQAClient:
         graph = graph.to(self.device)
         if self.text_bank is None:
             node_texts = self._node_texts(graph)
-            encoder = load_frozen_encoder("all-MiniLM-L6-v2", dim=384)
+            encoder = load_frozen_encoder(ENCODER_MODEL, dim=ENCODER_DIM)
             self.text_bank = build_text_bank(
                 node_texts,
                 encoder=encoder,
-                encoder_name="all-MiniLM-L6-v2",
-                dim=384,
+                encoder_name=ENCODER_MODEL,
+                dim=ENCODER_DIM,
                 device=self.device,
             )
         if self.condensor is None:
@@ -766,6 +767,7 @@ class FedCondQAClient:
 
         cap = int(getattr(self.args, "stage_b_max_queries", 256))
         q_emb = self._local_query_embeddings(cap)
+        n_q = 0 if q_emb is None else min(int(q_emb.size(0)), cap)
         cfg = RetrievalRefineConfig(
             iterations=iters,
             lr=float(getattr(self.args, "condense_refine_lr", 1e-2)),
@@ -780,6 +782,55 @@ class FedCondQAClient:
                 getattr(self.args, "preserve_sep_topology", True)
             ),
         )
+
+        # Refinement is deterministic given (config, base graph, query set), so
+        # persist the result and skip the 100-iter optimization on later runs.
+        # Query *content* (not just count) must be part of the key: two calls
+        # with the same n_q but different underlying local_qa_samples (e.g.
+        # after rebuilding the QA cache for this client/dataset) must not
+        # collide and silently reuse a stale refinement.
+        import hashlib
+        import json as _json
+
+        q_fingerprint = (
+            hashlib.md5(q_emb.detach().cpu().numpy().tobytes()).hexdigest()
+            if q_emb is not None else "none"
+        )
+        refine_key = hashlib.md5(_json.dumps({
+            "cfg": {k: getattr(cfg, k) for k in (
+                "iterations", "lr", "lambda_rep", "lambda_div", "delta_margin",
+                "tau_ret", "tau_cov", "max_queries", "knn_k",
+                "preserve_sep_topology", "seed",
+            )},
+            "base_nodes": int(condensed.x.size(0)),
+            "base_x_sum": round(float(condensed.x.float().sum()), 3),
+            "num_queries": n_q,
+            "q_fingerprint": q_fingerprint,
+        }, sort_keys=True).encode()).hexdigest()
+        cache_path = Path(self.data_dir) / "condensed_graph_refined.pt"
+        if cache_path.exists():
+            try:
+                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+            except Exception:
+                payload = None
+            if payload and payload.get("refine_key") == refine_key:
+                refined = Data(
+                    x=payload["x"].to(condensed.x.device),
+                    edge_index=payload["edge_index"].to(condensed.x.device),
+                    edge_weight=payload["edge_weight"].to(condensed.x.device),
+                    node_type=payload["node_type"].to(condensed.x.device),
+                )
+                refined.y = refined.node_type.long()
+                refined.num_global_classes = 3
+                self._condense_refined = True
+                self.last_stage_b_refine = payload.get("stats")
+                print(
+                    f"    [client_{self.client_id}] Stage B refine: loaded cached "
+                    f"condensed_graph_refined.pt (key match)",
+                    flush=True,
+                )
+                return refined
+
         refined, hist = refine_condensed_graph(
             tri_graph if tri_graph is not None else self.tri_graph,
             condensed,
@@ -795,7 +846,19 @@ class FedCondQAClient:
             "l_ret_start": hist["ret"][0],
             "l_ret_end": hist["ret"][-1],
         }
-        n_q = 0 if q_emb is None else min(int(q_emb.size(0)), cap)
+        try:
+            torch.save({
+                "x": refined.x.detach().cpu(),
+                "edge_index": refined.edge_index.detach().cpu(),
+                "edge_weight": (refined.edge_weight.detach().cpu()
+                                 if refined.edge_weight is not None
+                                 else torch.ones(refined.edge_index.size(1))),
+                "node_type": refined.node_type.detach().cpu(),
+                "refine_key": refine_key,
+                "stats": dict(self.last_stage_b_refine),
+            }, cache_path)
+        except Exception as exc:
+            print(f"    [client_{self.client_id}] WARN: could not cache refined graph: {exc}")
         ret_note = "" if n_q > 0 else ", L_ret skipped (no local queries)"
         print(
             f"    [client_{self.client_id}] Stage B refine (B.3.5): "
@@ -822,7 +885,7 @@ class FedCondQAClient:
             load_frozen_encoder,
         )
 
-        encoder = load_frozen_encoder("all-MiniLM-L6-v2", dim=384)
+        encoder = load_frozen_encoder(ENCODER_MODEL, dim=ENCODER_DIM)
         return encode_texts(encoder, questions, device=self.device)
 
     def _stage_b_config(self) -> ClientCondensationConfig:

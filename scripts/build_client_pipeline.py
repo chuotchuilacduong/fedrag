@@ -1,9 +1,13 @@
-"""Build trigraph + condensed graph + synthetic graph for all clients.
+"""Build trigraph + condensed anchor graph for all clients.
 
-Runs Stage A → B → C for every client that is missing any of:
+Runs Stage A → B for every client that is missing any of:
   processed/{dataset}/client_{m}/trigraph.pt
   processed/{dataset}/client_{m}/condensed_graph.pt
-  processed/{dataset}/client_{m}/synthetic_graph.pt
+
+The global synthetic memory (Stage C / FedRAG Phase 0) is NOT built here —
+it is initialized by the server at fl-train time from the one-time client
+anchor uploads, fusing ALL clients. A per-client offline synthetic graph
+would be both redundant and semantically wrong for the fedrag algorithm.
 
 Usage (from project root, fedcond env):
     python scripts/build_client_pipeline.py --dataset hotpotqa
@@ -18,9 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import tempfile
 import time
-from argparse import Namespace
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -39,11 +41,9 @@ from fedcond_grag.client.stage_b_condense import (
     save_text_bank,
 )
 from fedcond_grag.client.stage_b_condense.node_text_embedder import load_frozen_encoder
-from fedcond_grag.server.server import FedCondQAServer
 
 PROCESSED_ROOT = _ROOT / "processed"
-ENCODER_MODEL = "all-MiniLM-L6-v2"
-ENCODER_DIM = 384
+from fedcond_grag.constants import ENCODER_DIM, ENCODER_MODEL  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -137,99 +137,6 @@ def build_condensed(client_dir: Path, graph: Data, force: bool, topology_method:
 
 
 # ---------------------------------------------------------------------------
-# Stage C — Server condensation
-# ---------------------------------------------------------------------------
-
-def _make_server_args(log_dir: str, num_syn_nodes: int = 128) -> Namespace:
-    return Namespace(
-        fl_algorithm="fedcond_qa",
-        task="condensation_qa",
-        dataset=["hotpotqa"],
-        model=["gcn"],
-        hid_dim=64,
-        num_layers=2,
-        dropout=0.0,
-        lr=0.01,
-        weight_decay=0.0,
-        optim="adam",
-        metrics=["accuracy"],
-        num_clients=1,
-        num_global_syn_nodes=num_syn_nodes,
-        server_condense_iters=50,
-        condense_iters=10,
-        local_epochs=0,
-        lr_feat=1e-2,
-        lr_adj=1e-2,
-        pge_hidden=64,
-        pge_topk=8,
-        type_emb_dim=8,
-        surrogate_type_weight=1.0,
-        surrogate_link_weight=0.5,
-        surrogate_align_weight=0.1,
-        match_norm_weight=0.0,
-        condense_refresh_every=10,
-        preserve_sep_topology=True,
-        use_cuda=False,
-        gpuid=0,
-        dp_mech="no_dp",
-        dp_epsilon=0.0,
-        dp_delta=1e-5,
-        dp_clip=1.0,
-        train_val_test="default_split",
-        processing="raw",
-        processing_percentage=0.1,
-        feature_mask_prob=0.1,
-        homo_injection_ratio=0.0,
-        hete_injection_ratio=0.0,
-        debug=False,
-        wandb_name="build_pipeline",
-        log_root=log_dir,
-        data_root=log_dir,
-    )
-
-
-def build_synthetic(client_dir: Path, condensed_payload: dict, force: bool) -> None:
-    out = client_dir / "synthetic_graph.pt"
-    if out.exists() and not force:
-        print(f"    [C] synthetic_graph.pt exists — skipping")
-        return
-
-    anchor = Data(
-        x=condensed_payload["x"].float(),
-        edge_index=condensed_payload["edge_index"].long(),
-        edge_weight=condensed_payload["edge_weight"].float(),
-        node_type=condensed_payload["node_type"].long(),
-    )
-    anchor.y = anchor.node_type.clone()
-    anchor.num_global_classes = 3
-
-    message_pool = {
-        "sampled_clients": [0],
-        "client_0": {"anchor_graph": anchor},
-        "round": 0,
-    }
-
-    with tempfile.TemporaryDirectory() as tmp:
-        args = _make_server_args(tmp)
-        device = torch.device("cpu")
-        torch.manual_seed(42)
-        server = FedCondQAServer(args, anchor, tmp, message_pool, device)
-
-        print(f"    [C] Running server condensation ({args.server_condense_iters} iters)...")
-        t = time.time()
-        server.execute()
-        synthetic = server.export_synthetic_graph()
-        print(f"    [C] Done in {time.time()-t:.0f}s — {synthetic.x.shape[0]} syn nodes")
-
-    torch.save({
-        "x": synthetic.x.detach().cpu(),
-        "edge_index": synthetic.edge_index.detach().cpu(),
-        "edge_weight": synthetic.edge_weight.detach().cpu() if hasattr(synthetic, "edge_weight") else None,
-        "node_type": synthetic.node_type.detach().cpu(),
-    }, out)
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -241,8 +148,7 @@ def process_client(dataset: str, client_id: int, force: bool, topology_method: s
 
     print(f"\n=== client_{client_id} ===")
     graph = build_trigraph(client_dir, dataset, force)
-    condensed = build_condensed(client_dir, graph, force, topology_method=topology_method, entity_ratio=entity_ratio)
-    build_synthetic(client_dir, condensed, force)
+    build_condensed(client_dir, graph, force, topology_method=topology_method, entity_ratio=entity_ratio)
     print(f"  client_{client_id} done.")
 
 

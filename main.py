@@ -36,27 +36,70 @@ def main(argv: list[str] | None = None) -> int:
 # ---------------------------------------------------------------------------
 
 def _run_preprocess(argv: list[str]) -> int:
+    """One-shot data pipeline: everything between raw benchmark download and
+    `fl-train`. Idempotent — each step skips work whose output already exists
+    (pass --force to rebuild).
+
+        step 1  setup_datasets          → dataset/linearrag/<ds>/{chunks,questions}.json
+        step 2  preprocess_data         → processed/<ds>/client_<m>/chunks.json
+        step 3  build_client_pipeline   → trigraph.pt + condensed_graph.pt   (Stage A→B)
+        step 4  build_fedcond_qa_dataset→ <qa-out-root>/{records.jsonl,split,q_embs.pt}
+        step 5  preprocess_fedcond_qa   → processed/<ds>/client_<m>/ppr_node_map.pt
+        step 6  build_passage_anchors   → passage_embs.pt (optional, --with-passage-anchors)
+    """
+    import json
     import runpy
 
-    p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--dataset", default="hotpotqa")
-    p.add_argument("--num-clients", dest="num_clients", type=int, default=2)
-    p.add_argument("--force", action="store_true")
+    p = argparse.ArgumentParser(prog="fedcond_grag preprocess")
+    p.add_argument("--dataset", default="hotpotqa",
+                   choices=["hotpotqa", "2wikimultihop", "musique", "medical"])
+    p.add_argument("--num-clients", dest="num_clients", type=int, default=3)
+    p.add_argument("--force", action="store_true",
+                   help="Rebuild all artifacts even if they exist")
+    p.add_argument("--skip-download", dest="skip_download", action="store_true",
+                   help="Skip step 1 (use existing dataset/linearrag/<ds> files)")
+    p.add_argument("--qa-out-root", dest="qa_out_root", default="dataset/fedcond_qa",
+                   help="Output root for the QA cache (step 4). Use a per-dataset "
+                        "dir (e.g. dataset/fedcond_qa_musique) when working with "
+                        "multiple datasets, and pass the same path to fl-train "
+                        "via --qa-data-root.")
+    p.add_argument("--with-passage-anchors", dest="with_passage_anchors",
+                   action="store_true",
+                   help="Also build passage_embs.pt/passage_node_map.pt "
+                        "(needed only for fl-train --top-r-passages > 0)")
     p.add_argument("--topology-method", dest="topology_method", default="knn")
     p.add_argument("--entity-ratio", dest="entity_ratio", type=float, default=0.05)
-    known, _ = p.parse_known_args(argv)
+    p.add_argument("--top-k-passages", dest="top_k_passages", type=int, default=5,
+                   help="PPR passages mapped per question per client (step 5)")
+    known = p.parse_args(argv)
+    root = Path(__file__).resolve().parent
 
-    # Step 0: split raw LinearRAG data into per-client chunks (idempotent)
-    import scripts.preprocess_data as _pd  # noqa: F401  ensure on sys.path
-    sys.argv = [
-        "preprocess_data.py",
-        "--dataset", known.dataset,
-        "--num_clients", str(known.num_clients),
-    ]
+    def _step(n, title):
+        print(f"\n{'='*70}\n[preprocess {n}/6] {title}\n{'='*70}", flush=True)
+
+    # 1. Download + convert benchmark to LinearRAG format
+    _step(1, f"setup_datasets — dataset/linearrag/{known.dataset}")
+    linearrag_dir = root / "dataset" / "linearrag" / known.dataset
+    if known.skip_download:
+        print("  --skip-download: skipped")
+    elif known.dataset == "medical":
+        print("  'medical' is a private corpus — place chunks.json/questions.json "
+              f"under {linearrag_dir} manually; skipping download")
+    elif linearrag_dir.joinpath("chunks.json").exists() and not known.force:
+        print("  chunks.json exists — skipped (use --force to re-download)")
+    else:
+        sys.argv = ["setup_datasets.py", "--dataset", known.dataset] + (
+            ["--force"] if known.force else [])
+        runpy.run_module("scripts.setup_datasets", run_name="__main__")
+
+    # 2. Partition corpus into per-client shards
+    _step(2, f"preprocess_data — {known.num_clients} client shards")
+    sys.argv = ["preprocess_data.py", "--dataset", known.dataset,
+                "--num_clients", str(known.num_clients)]
     runpy.run_module("scripts.preprocess_data", run_name="__main__")
 
-    # Step 1-3: Stage A (trigraph) → B (condense) → C (synthetic) per client
-    import scripts.build_client_pipeline as _bp  # noqa: F401
+    # 3. Stage A (trigraph) → Stage B (condensed anchor) per client
+    _step(3, "build_client_pipeline — Stage A→B per client")
     build_argv = ["build_client_pipeline.py", "--dataset", known.dataset]
     if known.force:
         build_argv.append("--force")
@@ -66,6 +109,56 @@ def _run_preprocess(argv: list[str]) -> int:
         build_argv += ["--entity-ratio", str(known.entity_ratio)]
     sys.argv = build_argv
     runpy.run_module("scripts.build_client_pipeline", run_name="__main__")
+
+    # 4. QA records + splits + question embeddings
+    _step(4, f"build_fedcond_qa_dataset — {known.qa_out_root}")
+    qa_root = root / known.qa_out_root
+    cached_dataset = None
+    meta_path = qa_root / "_meta.json"
+    if meta_path.exists():
+        try:
+            cached_dataset = json.loads(meta_path.read_text()).get("dataset")
+        except Exception:
+            cached_dataset = None
+    if qa_root.joinpath("records.jsonl").exists() and not known.force and cached_dataset == known.dataset:
+        print("  records.jsonl exists (matches --dataset) — skipped (use --force to rebuild)")
+    else:
+        if qa_root.joinpath("records.jsonl").exists() and cached_dataset != known.dataset:
+            print(f"  cached QA data at {known.qa_out_root} belongs to dataset "
+                  f"'{cached_dataset}', not '{known.dataset}' — rebuilding "
+                  "(pass --qa-out-root to keep multiple datasets' QA caches around at once)")
+        sys.argv = ["build_fedcond_qa_dataset.py", "--dataset", known.dataset,
+                    "--out-root", known.qa_out_root]
+        runpy.run_module("scripts.build_fedcond_qa_dataset", run_name="__main__")
+
+    # 5. Per-client PPR passage node maps (evidence retrieval at train time)
+    _step(5, "preprocess_fedcond_qa — per-client ppr_node_map.pt")
+    processed = root / "processed" / known.dataset
+    have_maps = all(
+        (processed / f"client_{c}" / "ppr_node_map.pt").exists()
+        for c in range(known.num_clients)
+    )
+    if have_maps and not known.force:
+        print("  all ppr_node_map.pt exist — skipped (use --force to rebuild)")
+    else:
+        sys.argv = ["preprocess_fedcond_qa.py", "--dataset", known.dataset,
+                    "--top_k_passages", str(known.top_k_passages)]
+        runpy.run_module("scripts.preprocess_fedcond_qa", run_name="__main__")
+
+    # 6. Optional: passage anchors for --top-r-passages re-ranked desc
+    _step(6, "build_passage_anchors (optional)")
+    if not known.with_passage_anchors:
+        print("  skipped (enable with --with-passage-anchors)")
+    else:
+        sys.argv = ["build_passage_anchors.py",
+                    "--qa-root", known.qa_out_root,
+                    "--processed-root", f"processed/{known.dataset}",
+                    "--num-clients", str(known.num_clients)]
+        runpy.run_module("scripts.build_passage_anchors", run_name="__main__")
+
+    print(f"\npreprocess done — ready for:\n"
+          f"  python main.py fl-train --dataset {known.dataset} "
+          f"--num-clients {known.num_clients} --qa-data-root {known.qa_out_root} ...")
     return 0
 
 

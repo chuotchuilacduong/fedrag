@@ -117,9 +117,14 @@ fedcond_grag/
                   ▼
    processed/<ds>/client_<m>/condensed_graph.pt    (anchor C_m)
                   │
-                  │  Stage C (FedCondQAServer.execute)
+                  │  Stage B.3.5 refine at fl-train round 0 (cached)
                   ▼
-   processed/<ds>/client_<m>/synthetic_graph.pt    (G_global, broadcast)
+   processed/<ds>/client_<m>/condensed_graph_refined.pt
+                  │
+                  │  Stage C / FedRAG Phase 0 — at fl-train time only:
+                  │  server fuses ALL client anchors into Θ_syn in-memory
+                  ▼
+   message_pool["server"]  (G_syn broadcast; no per-client disk artifact)
                   │
                   │  preprocess_fedcond_qa.py — Stage D cache build
                   ▼
@@ -317,7 +322,11 @@ surrogate_link_weight:   0.5           # link-prediction loss weight
 match_norm_weight:       0.0
 ```
 
-**On disk:** in the offline smoke pipeline, `processed/<dataset>/client_<m>/synthetic_graph.pt` is written per client (one copy per directory for caching). In a real federated run this artifact is broadcast in `message_pool["server"]`.
+**On disk:** nothing — Stage C / FedRAG Phase 0 runs at fl-train time only and
+the synthetic memory lives in `message_pool["server"]`. (`main.py preprocess`
+used to also write a per-client `synthetic_graph.pt`; that offline Stage C was
+removed — it fused only one client's anchor with the legacy gradient-match
+mode and nothing consumed it. Preprocess now stops at Stage A→B.)
 
 **Smoke test:** `python scripts/stage_c_smoke.py`
 
@@ -553,9 +562,13 @@ All commands go through the root `main.py` shim, which dispatches to
 `fedcond_grag.cli.main()`.
 
 ```bash
-# Stage A→B→C orchestrator (uses scripts/build_client_pipeline.py)
-python main.py preprocess --dataset hotpotqa --num_clients 5
-python main.py preprocess --dataset hotpotqa --clients 0 1 2 --force
+# Full data pipeline in ONE command — download → partition → Stage A/B →
+# QA records/splits → PPR node maps (each step skips existing outputs).
+# See docs/SETUP.md for the fresh-machine runbook.
+python main.py preprocess --dataset hotpotqa --num-clients 3
+python main.py preprocess --dataset hotpotqa --num-clients 3 --force
+python main.py preprocess --dataset musique --num-clients 3 \
+    --qa-out-root dataset/fedcond_qa_musique   # multi-dataset safe
 
 # Federated round loop (Stage C aggregation; Stage B happens inside the client)
 python main.py fl-train --dataset hotpotqa --num-clients 5 --num-rounds 1
@@ -629,19 +642,10 @@ cached under `dataset/raw/`.
 ## 11. End-to-end run, 5 clients, hotpotqa
 
 ```bash
-# 0. Place raw LinearRAG inputs at dataset/linearrag/hotpotqa/{chunks,questions}.json
-
-# 1. Partition the corpus into 5 client slices.
-python scripts/preprocess_data.py --dataset hotpotqa --num_clients 5
-
-# 2. Build Stage A→B→C artifacts for every client.
-python main.py preprocess --dataset hotpotqa
-
-# 3. (Optional) run the federated round loop end-to-end.
-python main.py fl-train --dataset hotpotqa --num-clients 5 --num-rounds 1
-
-# 4. Build the Stage D dual-graph cache (one PyG Data per question).
-python scripts/preprocess_fedcond_qa.py
+# 1-4. Everything data-side in one command (download → partition → Stage A/B
+#      → QA records → PPR maps). Individual scripts remain runnable standalone;
+#      see docs/SETUP.md §6 for the step ↔ script mapping.
+python main.py preprocess --dataset hotpotqa --num-clients 5
 
 # 5. Train DualGraphLLM (Stage D).
 python main.py train \
