@@ -5,20 +5,26 @@
 #   pip install -r requirements.txt
 #   python -m spacy download en_core_web_sm
 #
-# torch/torch_scatter are pinned to 2.5.0+cu124 via the extra index/find-links
-# below (torch 2.6+ dropped prebuilt torch_scatter wheels); verified against
-# an RTX 4060 / driver CUDA 13.0 setup -- cu124 wheels run fine under a newer
-# driver.
+# torch/torch_scatter are pinned to 2.9.1+cu128 via the extra index/find-links
+# below. Needs to be at least torch>=2.7.0+cu128 for Blackwell (RTX 50-series,
+# CUDA capability sm_120) GPU support -- an older pin (2.5.0+cu124, this
+# project's original dev machine had an Ada/RTX 4060) fails on sm_120 with
+# "CUDA capability sm_120 is not compatible with the current PyTorch
+# installation". cu128 wheels remain compatible with older architectures too
+# (Ada/sm_89 and earlier), so this one pin covers both. Confirmed a prebuilt
+# torch_scatter wheel exists for this exact combo at data.pyg.org/whl before
+# picking it -- pyg's wheel builds lag new torch releases, not every
+# torch+cuda combo has one.
 #
 # This file is only for the core method. The baselines under
 # fedcond_grag/baselines/ (HippoRAG, GRAG, FLARE, ComoRAG, G-Retriever) each
 # need extra, heavier, sometimes fragile dependencies for a fair-comparison
 # run -- see requirements-baselines.txt, kept separate so installing it
 # never risks the core method's own working environment.
---extra-index-url https://download.pytorch.org/whl/cu124
---find-links https://data.pyg.org/whl/torch-2.5.0+cu124.html
+--extra-index-url https://download.pytorch.org/whl/cu128
+--find-links https://data.pyg.org/whl/torch-2.9.1+cu128.html
 
-torch==2.5.0
+torch==2.9.1
 torch_scatter
 
 torch-geometric==2.8.0.post1
