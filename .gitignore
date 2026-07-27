@@ -83,8 +83,12 @@ processed/
 # Datasets (downloaded / derived — too large for git)
 dataset/fedcond_qa/
 dataset/fedcond_qa_medical_backup/
-dataset/linearrag/hotpotqa/chunks.json
-dataset/linearrag/hotpotqa/questions.json
+
+# dataset/linearrag/{hotpotqa,musique,2wikimultihop}/{chunks,questions}.json
+# are intentionally TRACKED (like dataset/raw/ below): all three are now
+# built by scripts/setup_datasets.py from the same fixed 1000-question
+# HippoRAG benchmark split, so committing them means a fresh clone needs no
+# extra dataset-build step for the main training pipeline either.
 
 # dataset/raw/ (hotpotqa/musique/2wikimultihopqa + corpora, ~41MB) is
 # intentionally TRACKED, not ignored: it's the exact HippoRAG paper
