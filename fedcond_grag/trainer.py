@@ -64,45 +64,47 @@ class FedTrainer:
 
         self._load_dotenv()
         self._wandb = None
-        if os.environ.get("WANDB_API_KEY"):
-            try:
-                import wandb
-                # Auto-generate a descriptive run name from dual_graph_mode when
-                # no explicit name is given, so ablations are easy to filter on WandB.
-                _mode = getattr(args, "dual_graph_mode", "shared")
-                _auto_names = {
-                    "both": "dual-encoder",
-                    "dual": "dual-encoder",
-                    "shared": "ablation-shared-encoder",
-                    "no_synthetic": "ablation-no-synthetic",
-                    "evidence_only": "ablation-evidence-only",
-                    "condensed_only": "ablation-condensed-only",
-                    "none": "ablation-text-only",
-                    "text_only": "ablation-text-only",
-                }
-                _run_name = (getattr(args, "wandb_run_name", None)
-                             or _auto_names.get(_mode, f"mode-{_mode}"))
-                _tags = list(getattr(args, "wandb_tags", None) or [])
-                if _mode not in _tags:
-                    _tags.append(_mode)
-                _tags.append("fl-train")
-                self._wandb = wandb.init(
-                    project=os.environ.get("WANDB_PROJECT", getattr(args, "wandb_project", "fedcond-graphrag")),
-                    name=_run_name,
-                    group=getattr(args, "wandb_group", None),
-                    tags=_tags,
-                    config=vars(args) if hasattr(args, "__dict__") else {},
-                    resume="allow",
-                )
-                # Define two independent x-axes so round-level and step-level
-                # charts never share the same counter and WandB never drops data.
-                wandb.define_metric("comm_round")
-                wandb.define_metric("round/*", step_metric="comm_round")
-                wandb.define_metric("global_step")
-                wandb.define_metric("step/*", step_metric="global_step")
-                print(f"[wandb] run: {self._wandb.url}", flush=True)
-            except Exception as exc:
-                print(f"[wandb] init failed, continuing without: {exc}", flush=True)
+        # Always attempt to log — don't gate on WANDB_API_KEY being explicitly
+        # set, since a prior `wandb login` (netrc/config-based auth) never
+        # sets that env var. Set WANDB_MODE=disabled/offline to opt out.
+        try:
+            import wandb
+            # Auto-generate a descriptive run name from dual_graph_mode when
+            # no explicit name is given, so ablations are easy to filter on WandB.
+            _mode = getattr(args, "dual_graph_mode", "shared")
+            _auto_names = {
+                "both": "dual-encoder",
+                "dual": "dual-encoder",
+                "shared": "ablation-shared-encoder",
+                "no_synthetic": "ablation-no-synthetic",
+                "evidence_only": "ablation-evidence-only",
+                "condensed_only": "ablation-condensed-only",
+                "none": "ablation-text-only",
+                "text_only": "ablation-text-only",
+            }
+            _run_name = (getattr(args, "wandb_run_name", None)
+                         or _auto_names.get(_mode, f"mode-{_mode}"))
+            _tags = list(getattr(args, "wandb_tags", None) or [])
+            if _mode not in _tags:
+                _tags.append(_mode)
+            _tags.append("fl-train")
+            self._wandb = wandb.init(
+                project=os.environ.get("WANDB_PROJECT", getattr(args, "wandb_project", "fedcond-graphrag")),
+                name=_run_name,
+                group=getattr(args, "wandb_group", None),
+                tags=_tags,
+                config=vars(args) if hasattr(args, "__dict__") else {},
+                resume="allow",
+            )
+            # Define two independent x-axes so round-level and step-level
+            # charts never share the same counter and WandB never drops data.
+            wandb.define_metric("comm_round")
+            wandb.define_metric("round/*", step_metric="comm_round")
+            wandb.define_metric("global_step")
+            wandb.define_metric("step/*", step_metric="global_step")
+            print(f"[wandb] run: {self._wandb.url}", flush=True)
+        except Exception as exc:
+            print(f"[wandb] init failed, continuing without: {exc}", flush=True)
 
     # ------------------------------------------------------------------
     # Main training loop
