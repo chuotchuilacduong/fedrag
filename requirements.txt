@@ -1,0 +1,41 @@
+# FedCondGraphRAG — core method environment (preprocess / fl-train / train /
+# infer). Reproducible on a fresh server in two commands:
+#
+#   conda create -n fedrag python=3.11 -y && conda activate fedrag
+#   pip install -r requirements.txt
+#   python -m spacy download en_core_web_sm
+#
+# torch/torch_scatter are pinned to 2.5.0+cu124 via the extra index/find-links
+# below (torch 2.6+ dropped prebuilt torch_scatter wheels); verified against
+# an RTX 4060 / driver CUDA 13.0 setup -- cu124 wheels run fine under a newer
+# driver.
+#
+# This file is only for the core method. The baselines under
+# fedcond_grag/baselines/ (HippoRAG, GRAG, FLARE, ComoRAG, G-Retriever) each
+# need extra, heavier, sometimes fragile dependencies for a fair-comparison
+# run -- see requirements-baselines.txt, kept separate so installing it
+# never risks the core method's own working environment.
+--extra-index-url https://download.pytorch.org/whl/cu124
+--find-links https://data.pyg.org/whl/torch-2.5.0+cu124.html
+
+torch==2.5.0
+torch_scatter
+
+torch-geometric==2.8.0.post1
+transformers==5.14.1
+peft==0.19.1
+accelerate==1.14.0
+bitsandbytes==0.50.0
+sentencepiece==0.2.2
+sentence-transformers==5.6.1
+spacy==3.8.14
+gensim==4.4.0
+python-igraph==1.0.0
+datasets==5.0.0
+wandb==0.28.1
+openai==2.48.0
+httpx==0.28.1
+pandas==3.0.5
+tqdm==4.69.1
+pytest==9.1.1
+numpy==2.4.6

@@ -49,6 +49,8 @@ coverage.xml
 # Output
 *.out
 *.txt
+!requirements.txt
+!requirements-*.txt
 
 # Sphinx documentation
 docs/_build/
@@ -83,7 +85,13 @@ dataset/fedcond_qa/
 dataset/fedcond_qa_medical_backup/
 dataset/linearrag/hotpotqa/chunks.json
 dataset/linearrag/hotpotqa/questions.json
-dataset/raw/
+
+# dataset/raw/ (hotpotqa/musique/2wikimultihopqa + corpora, ~41MB) is
+# intentionally TRACKED, not ignored: it's the exact HippoRAG paper
+# benchmark data (see scripts/setup_datasets.py), committed so baseline
+# comparisons stay reproducible even if upstream's reproduce/dataset/
+# changes later. Used only by fedcond_grag/baselines/* -- not the main
+# FedCondGraphRAG training pipeline (that uses dataset/linearrag/*).
 
 # Large binary tensors
 *.pt

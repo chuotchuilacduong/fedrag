@@ -1,0 +1,64 @@
+# Extra dependencies for fedcond_grag/baselines/* (HippoRAG, GRAG, FLARE,
+# ComoRAG, G-Retriever fair-comparison runs) -- NOT needed to run the core
+# FedCondGraphRAG method, see requirements.txt for that.
+#
+# Install after requirements.txt, in the same env:
+#
+#   pip install -r requirements-baselines.txt
+#   pip install --no-deps "hipporag @ git+https://github.com/OSU-NLP-Group/HippoRAG.git@e37fba2af1a951ac340d837a7c02efb9d8c9544a"
+#
+# hipporag MUST stay a separate, final, --no-deps install: its own
+# requires-dist hard-pins torch==2.5.1/transformers==4.45.2/vllm==..., which
+# would silently overwrite every pin in requirements.txt if pip were allowed
+# to resolve it normally. Installing it last with --no-deps means it just
+# reuses what's already pinned there instead.
+#
+# G-Retriever needs nothing extra (fedcond_grag's own model *is* a fork of
+# it, see fedcond_grag/baselines/gretriever/); GRAG needs nothing beyond
+# what's below either (its vendored code only needs deps requirements.txt
+# already covers, plus networkx/joblib here).
+
+# --- baselines/hipporag ---
+# These are hipporag's own runtime deps for the backends we actually use
+# (OpenAI-compatible LLM + Transformers/ embedding + parquet vector store).
+# litellm/gritlm/boto3 are needed too: hipporag's llm/__init__.py and
+# embedding_model/__init__.py eagerly import their Bedrock/GritLM/Cohere
+# backends at module load time even though we never select them. litellm in
+# particular has no prebuilt wheel on some platforms and needs a Rust/Cargo
+# toolchain to build from source -- install Rust first if `pip install
+# litellm` fails (https://rustup.rs/), or skip this file's hipporag section
+# entirely if you don't need that specific baseline.
+# `vllm` is intentionally NOT listed -- HippoRAG's vllm-offline OpenIE
+# backend import is stubbed out in client_runner.py instead of installed
+# (real vllm pins a torch build that conflicts with requirements.txt's).
+einops
+litellm
+gritlm
+boto3
+filelock
+tenacity
+pydantic
+packaging
+pyarrow
+
+# --- baselines/grag ---
+# GRAG's vendored utils/graph_retrieval.py imports these two at module
+# level (only actually used in the augment="path" mode this baseline
+# doesn't use, but still required for the module to import).
+networkx
+joblib
+
+# --- baselines/flare ---
+# FLARE's vendored ApiReturn (_vendor/api_return.py) imports tiktoken at
+# module level for a fallback token-count path this baseline's usage never
+# reaches (we always request logprobs, so `has_tokens` is always True) --
+# still required to import.
+tiktoken
+
+# --- baselines/comorag ---
+# ComoRAG is a fork of HippoRAG (see _vendor/VENDORED.md) so it needs the
+# same deps as the hipporag section above (already listed there). umap-learn
+# is the one new dep, needed by utils/cluster_utils.py for the
+# semantic/episodic memory clustering (need_cluster=True, ComoRAG's actual
+# novel contribution).
+umap-learn
