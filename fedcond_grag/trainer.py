@@ -25,6 +25,7 @@ import torch
 
 from fedcond_grag.client.client import FedCondQAClient
 from fedcond_grag.constants import ENCODER_DIM
+from fedcond_grag.server.lora_aggregate import has_lora, lora_state_dict
 from fedcond_grag.server.server import FedCondQAServer
 from fedcond_grag.utils.evaluate import exact_match, normalize, token_f1
 
@@ -61,6 +62,9 @@ class FedTrainer:
 
         self._metrics_path = Path(getattr(args, "metrics_path", "/tmp/fl_metrics.jsonl"))
         self._metrics_path.write_text("")   # reset on new run
+
+        self._save_best_path = getattr(args, "save_best_path", None)
+        self._best_val_acc = float("-inf")
 
         self._load_dotenv()
         self._wandb = None
@@ -208,6 +212,11 @@ class FedTrainer:
                     print(f"    test  : hit {test_metrics['hit']:.1f}% | "
                           f"EM {test_metrics['em']:.1f}% | F1 {test_metrics['f1']:.1f}", flush=True)
                 eval_time = time.perf_counter() - t_eval
+
+                if (self._save_best_path and val_acc is not None
+                        and val_acc > self._best_val_acc):
+                    self._best_val_acc = val_acc
+                    self._save_checkpoint(round_id, val_metrics, test_metrics)
                 print(f"    eval done in {eval_time:.1f}s", flush=True)
 
             round_time = time.perf_counter() - t_round_start
@@ -238,6 +247,35 @@ class FedTrainer:
             self._log_metrics(metrics, global_step=global_step)
 
         self._print_metrics_table(round_metrics)
+
+    # ------------------------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------------------------
+
+    def _save_checkpoint(self, round_id: int, val_metrics: dict, test_metrics: dict | None) -> None:
+        """Persist only the LoRA adapter (LLM fine-tune) — the graph encoder/
+        projector are not saved here, matching text-only-question LoRA runs
+        (--dual-graph-mode none) where the graph model is never trained.
+        """
+        model = self.shared_model
+        if not has_lora(model.model):
+            print("    [checkpoint] skipped -- no LoRA adapter present "
+                  "(pass --llm-frozen False)", flush=True)
+            return
+        payload = {
+            "round": round_id,
+            "val_metrics": dict(val_metrics) if val_metrics else None,
+            "test_metrics": dict(test_metrics) if test_metrics else None,
+            "dataset": getattr(self.args, "dataset", None),
+            "lora_agg_method": getattr(self.args, "lora_agg_method", None),
+            "lora": lora_state_dict(model.model),
+        }
+
+        path = Path(self._save_best_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(payload, path)
+        print(f"    [checkpoint] new best val hit {self._best_val_acc:.2f}% "
+              f"(round {round_id}) -> {path}", flush=True)
 
     # ------------------------------------------------------------------
     # Evaluation

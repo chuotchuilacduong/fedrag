@@ -297,6 +297,16 @@ def _run_fl_train(argv: list[str]) -> int:
                    help="WandB tags for filtering (e.g. --wandb-tags ablation shared).")
     p.add_argument("--wandb-group", dest="wandb_group", default=None,
                    help="WandB group name for grouping related runs.")
+    p.add_argument("--save-best", dest="save_best", action="store_true",
+                   help="Save the LoRA adapter (only, not the graph encoder/projector or "
+                        "frozen LLM backbone) whenever val hit%% improves. Requires "
+                        "--llm-frozen False. Off by default -- pass this to opt in, e.g. "
+                        "so the fine-tuned LLM can be reused as the base model for other "
+                        "baseline RAG methods.")
+    p.add_argument("--save-best-path", dest="save_best_path", default=None,
+                   help="Where to write the checkpoint from --save-best. Defaults to "
+                        "checkpoints/<dataset>/<lora-agg-method>/best.pt when --save-best "
+                        "is set without an explicit path.")
     p.add_argument("--top-r-passages", dest="top_r_passages", type=int, default=0,
                    help="If >0, re-rank each record's retrieved_passages by q_emb similarity "
                         "and keep the top-r as 'desc'. Also exposes anchor_passage_nodes for "
@@ -307,6 +317,12 @@ def _run_fl_train(argv: list[str]) -> int:
                         "(default = --top-r-passages). Useful for using all 10 passages as "
                         "text but anchoring the evidence graph on the top-3 only.")
     args = p.parse_args(argv)
+
+    if args.save_best:
+        if not args.save_best_path:
+            args.save_best_path = f"checkpoints/{args.dataset}/{args.lora_agg_method}/best.pt"
+    else:
+        args.save_best_path = None
 
     from fedcond_grag.trainer import FedTrainer
     from fedcond_grag.utils.seed import seed_everything
