@@ -177,7 +177,7 @@ def _run_fl_train(argv: list[str]) -> int:
     p.add_argument("--gpuid", type=int, default=0)
     p.add_argument("--data-root", dest="data_root", default="processed")
     p.add_argument("--num-global-syn-nodes", dest="num_global_syn_nodes", type=int, default=128)
-    p.add_argument("--server-condense-iters", dest="server_condense_iters", type=int, default=50)
+    p.add_argument("--server-condense-iters", dest="server_condense_iters", type=int, default=500)
     p.add_argument("--server-stage-c-mode", dest="server_stage_c_mode", default="fedrag",
                    choices=["fedrag", "gradient_match", "repr_align", "both"],
                    help="Synthetic-graph refinement algorithm. 'fedrag' (default) = paper "
@@ -185,7 +185,7 @@ def _run_fl_train(argv: list[str]) -> int:
                         "query-conditioned synthetic-memory adaptation with server delta "
                         "aggregation. Legacy modes refine the synthetic graph server-side "
                         "against client anchors every round.")
-    p.add_argument("--syn-mem-steps", dest="syn_mem_steps", type=int, default=5,
+    p.add_argument("--syn-mem-steps", dest="syn_mem_steps", type=int, default=200,
                    help="K_mem: client-side synthetic-memory adaptation steps per round "
                         "(fedrag mode; 0 disables adaptation → server only re-broadcasts)")
     p.add_argument("--syn-mem-lr", dest="syn_mem_lr", type=float, default=1e-3,
@@ -207,7 +207,7 @@ def _run_fl_train(argv: list[str]) -> int:
                    help="η_reg: server L_reg gradient step size after delta aggregation")
     p.add_argument("--server-reg-steps", dest="server_reg_steps", type=int, default=1,
                    help="Server-side L_reg gradient steps per round (fedrag mode)")
-    p.add_argument("--condense-refine-iters", dest="condense_refine_iters", type=int, default=100,
+    p.add_argument("--condense-refine-iters", dest="condense_refine_iters", type=int, default=1000,
                    help="Stage B refinement steps minimizing L_cond = L_ret(KL) + "
                         "λ_rep·L_rep + λ_div·L_div before uploading the anchor graph "
                         "(paper B.3.5; 0 disables → constructive init only)")

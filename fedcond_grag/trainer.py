@@ -185,12 +185,12 @@ class FedTrainer:
                 self.clients[cid].send_message()
                 client_times[cid] = time.perf_counter() - t0
                 loss_str = f" | loss: {loss:.4f}" if round_id >= 1 else ""
-                print(f"    client_{cid}{loss_str} | {client_times[cid]:.1f}s", flush=True)
+                print(f"    client_{cid}{loss_str} | {client_times[cid]:.2f}s", flush=True)
 
             t0 = time.perf_counter()
             self.server.execute()
             agg_time = time.perf_counter() - t0
-            print(f"    server agg done in {agg_time:.1f}s", flush=True)
+            print(f"    server agg done in {agg_time:.2f}s", flush=True)
 
             train_acc = val_acc = test_acc = None
             val_metrics = test_metrics = None
@@ -204,20 +204,20 @@ class FedTrainer:
                 if self._val_samples:
                     val_metrics = self._eval_split_acc(self._val_samples)
                     val_acc = val_metrics["hit"]
-                    print(f"    val   : hit {val_metrics['hit']:.1f}% | "
-                          f"EM {val_metrics['em']:.1f}% | F1 {val_metrics['f1']:.1f}", flush=True)
+                    print(f"    val   : hit {val_metrics['hit']:.2f}% | "
+                          f"EM {val_metrics['em']:.2f}% | F1 {val_metrics['f1']:.2f}", flush=True)
                 if self._test_samples:
                     test_metrics = self._eval_split_acc(self._test_samples)
                     test_acc = test_metrics["hit"]
-                    print(f"    test  : hit {test_metrics['hit']:.1f}% | "
-                          f"EM {test_metrics['em']:.1f}% | F1 {test_metrics['f1']:.1f}", flush=True)
+                    print(f"    test  : hit {test_metrics['hit']:.2f}% | "
+                          f"EM {test_metrics['em']:.2f}% | F1 {test_metrics['f1']:.2f}", flush=True)
                 eval_time = time.perf_counter() - t_eval
 
                 if (self._save_best_path and val_acc is not None
                         and val_acc > self._best_val_acc):
                     self._best_val_acc = val_acc
                     self._save_checkpoint(round_id, val_metrics, test_metrics)
-                print(f"    eval done in {eval_time:.1f}s", flush=True)
+                print(f"    eval done in {eval_time:.2f}s", flush=True)
 
             round_time = time.perf_counter() - t_round_start
             avg_loss = (
@@ -383,7 +383,7 @@ class FedTrainer:
         print(hdr)
         print("-" * W)
         def _f(v):
-            return f"{v:>6.1f}%" if v is not None else f"{'N/A':>7}"
+            return f"{v:>6.2f}%" if v is not None else f"{'N/A':>7}"
 
         for m in round_metrics:
             if m["avg_loss"] is None:
