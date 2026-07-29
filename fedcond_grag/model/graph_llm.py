@@ -154,7 +154,17 @@ class GraphLLM(torch.nn.Module):
                 param.requires_grad = False
         else:
             print("Training LLAMA with LORA!")
-            model = prepare_model_for_kbit_training(model)
+            # prepare_model_for_kbit_training enables gradient checkpointing by
+            # default with use_reentrant=True (PEFT's default) unless told
+            # otherwise -- reentrant checkpointing raises on the .grad()-based
+            # backward FedRAG's adapt_synthetic_memory() does (torch.autograd.grad
+            # against z_c), independent of the --llm-gradient-checkpointing flag
+            # below. Force non-reentrant here so both paths agree.
+            model = prepare_model_for_kbit_training(
+                model,
+                use_gradient_checkpointing=bool(getattr(args, "llm_gradient_checkpointing", False)),
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+            )
             lora_r = int(getattr(args, "lora_rank", 8))
             lora_alpha = int(getattr(args, "lora_alpha", 16))
             lora_dropout = float(getattr(args, "lora_dropout", 0.05))

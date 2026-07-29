@@ -432,6 +432,28 @@ class FedTrainer:
     def _init_stage_d(self) -> None:
         from fedcond_grag.dataloader import FedCondQADataset
         qa_root = getattr(self.args, "qa_data_root", "dataset/fedcond_qa")
+
+        # qa_root is a shared path across datasets by default (dataset/fedcond_qa),
+        # rebuilt in place by scripts/build_fedcond_qa_dataset.py / main.py
+        # preprocess. If a run for a *different* --dataset rebuilt it last and
+        # this run's num_rounds<=1 skipped calling preprocess again, loading it
+        # here would silently train/eval against the wrong dataset's questions
+        # while trigraph/ppr_node_map are still this dataset's. Refuse instead.
+        meta_path = Path(qa_root) / "_meta.json"
+        if meta_path.exists():
+            try:
+                cached_dataset = json.loads(meta_path.read_text()).get("dataset")
+            except Exception:
+                cached_dataset = None
+            if cached_dataset and cached_dataset != self.args.dataset:
+                raise RuntimeError(
+                    f"QA cache at '{qa_root}' belongs to dataset '{cached_dataset}', "
+                    f"not '{self.args.dataset}'. Rebuild it first: "
+                    f"python scripts/build_fedcond_qa_dataset.py --dataset {self.args.dataset} "
+                    f"--out-root {qa_root} (or re-run 'python main.py preprocess --dataset "
+                    f"{self.args.dataset}'). Refusing to silently train/eval on mismatched data."
+                )
+
         top_r = int(getattr(self.args, "top_r_passages", 0))
         top_r_anchor = getattr(self.args, "top_r_anchor", None)
         if top_r_anchor is not None:
