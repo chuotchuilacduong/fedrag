@@ -40,6 +40,9 @@ DATASET_ROOT = _ROOT / "dataset" / "linearrag"
 PROCESSED_ROOT = _ROOT / "processed"
 
 ALL_DATASETS = ["hotpotqa", "2wikimultihop", "musique", "medical"]
+# Separate 1000-question training pools (scripts/download_train_split.py),
+# distinct from the eval benchmark above -- excluded from "--dataset all".
+TRAIN_VARIANTS = ["hotpotqa_train", "2wikimultihop_train", "musique_train"]
 
 
 def preprocess_one(dataset_name: str, num_clients: int, verbose: bool = True) -> dict:
@@ -80,7 +83,7 @@ def preprocess_one(dataset_name: str, num_clients: int, verbose: bool = True) ->
 def main():
     parser = argparse.ArgumentParser(description="Preprocess LinearRAG datasets into per-client chunks.")
     parser.add_argument("--dataset", default="hotpotqa",
-                        choices=ALL_DATASETS + ["all"],
+                        choices=ALL_DATASETS + TRAIN_VARIANTS + ["all"],
                         help="Dataset to process (or 'all')")
     parser.add_argument("--num_clients", type=int, default=5,
                         help="Number of federated clients (default: 5)")

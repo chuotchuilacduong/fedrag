@@ -142,7 +142,8 @@ def process_client(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="hotpotqa",
-                        choices=["hotpotqa", "2wikimultihop", "musique", "medical"])
+                        choices=["hotpotqa", "2wikimultihop", "musique", "medical",
+                                 "hotpotqa_train", "2wikimultihop_train", "musique_train"])
     parser.add_argument("--max_questions", type=int, default=None)
     parser.add_argument("--top_k_passages", type=int, default=5,
                         help="Top-k PPR passages to map per client per question")

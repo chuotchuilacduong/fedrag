@@ -52,7 +52,8 @@ def _run_preprocess(argv: list[str]) -> int:
 
     p = argparse.ArgumentParser(prog="fedcond_grag preprocess")
     p.add_argument("--dataset", default="hotpotqa",
-                   choices=["hotpotqa", "2wikimultihop", "musique", "medical"])
+                   choices=["hotpotqa", "2wikimultihop", "musique", "medical",
+                            "hotpotqa_train", "2wikimultihop_train", "musique_train"])
     p.add_argument("--num-clients", dest="num_clients", type=int, default=3)
     p.add_argument("--force", action="store_true",
                    help="Rebuild all artifacts even if they exist")
@@ -71,6 +72,12 @@ def _run_preprocess(argv: list[str]) -> int:
     p.add_argument("--entity-ratio", dest="entity_ratio", type=float, default=0.05)
     p.add_argument("--top-k-passages", dest="top_k_passages", type=int, default=5,
                    help="PPR passages mapped per question per client (step 5)")
+    p.add_argument("--qa-test-only", dest="qa_test_only", action="store_true",
+                   help="Step 4: put all of --dataset's questions in the test split "
+                        "(train/val empty) instead of the default 80/10/10. Use this "
+                        "for a dataset held out purely for final eval -- e.g. after "
+                        "training on a separate <dataset>_train pseudo-dataset -- so "
+                        "none of these questions are ever used for training.")
     known = p.parse_args(argv)
     root = Path(__file__).resolve().parent
 
@@ -85,6 +92,13 @@ def _run_preprocess(argv: list[str]) -> int:
     elif known.dataset == "medical":
         print("  'medical' is a private corpus — place chunks.json/questions.json "
               f"under {linearrag_dir} manually; skipping download")
+    elif known.dataset.endswith("_train"):
+        if not linearrag_dir.joinpath("chunks.json").exists():
+            raise FileNotFoundError(
+                f"{linearrag_dir} not found. Build it first: "
+                f"python scripts/download_train_split.py --dataset {known.dataset[:-len('_train')]}"
+            )
+        print(f"  '{known.dataset}' built by scripts/download_train_split.py — skipping download")
     elif linearrag_dir.joinpath("chunks.json").exists() and not known.force:
         print("  chunks.json exists — skipped (use --force to re-download)")
     else:
@@ -128,7 +142,8 @@ def _run_preprocess(argv: list[str]) -> int:
                   f"'{cached_dataset}', not '{known.dataset}' — rebuilding "
                   "(pass --qa-out-root to keep multiple datasets' QA caches around at once)")
         sys.argv = ["build_fedcond_qa_dataset.py", "--dataset", known.dataset,
-                    "--out-root", known.qa_out_root]
+                    "--out-root", known.qa_out_root] + (
+            ["--test-only"] if known.qa_test_only else [])
         runpy.run_module("scripts.build_fedcond_qa_dataset", run_name="__main__")
 
     # 5. Per-client PPR passage node maps (evidence retrieval at train time)
@@ -307,6 +322,18 @@ def _run_fl_train(argv: list[str]) -> int:
                    help="Where to write the checkpoint from --save-best. Defaults to "
                         "checkpoints/<dataset>/<lora-agg-method>/best.pt when --save-best "
                         "is set without an explicit path.")
+    p.add_argument("--load-checkpoint", dest="load_checkpoint", default=None,
+                   help="Load a --save-best LoRA checkpoint into the model before "
+                        "training/eval. Must be paired with --llm-frozen False and the "
+                        "same --lora-rank/--lora-alpha/--lora-target-modules/"
+                        "--dual-graph-mode used to produce it, or the adapter's key "
+                        "names won't line up.")
+    p.add_argument("--eval-only", dest="eval_only", action="store_true",
+                   help="Skip the training rounds and server aggregation entirely -- just "
+                        "run the (optionally --load-checkpoint-restored) model once against "
+                        "--dataset's test split. Pair with a --dataset preprocessed via "
+                        "'main.py preprocess --qa-test-only' so its whole question set is "
+                        "the test split, and --max-eval-samples set above that count.")
     p.add_argument("--top-r-passages", dest="top_r_passages", type=int, default=0,
                    help="If >0, re-rank each record's retrieved_passages by q_emb similarity "
                         "and keep the top-r as 'desc'. Also exposes anchor_passage_nodes for "

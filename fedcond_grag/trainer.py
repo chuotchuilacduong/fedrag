@@ -57,8 +57,13 @@ class FedTrainer:
         self._train_eval_samples: list = []
         self._val_samples: list = []
         self._test_samples: list = []
-        if int(getattr(args, "num_rounds", 1)) > 1:
+        self._eval_only = bool(getattr(args, "eval_only", False))
+        if int(getattr(args, "num_rounds", 1)) > 1 or self._eval_only:
             self._init_stage_d()
+
+        load_ckpt = getattr(args, "load_checkpoint", None)
+        if load_ckpt:
+            self._load_checkpoint(load_ckpt)
 
         self._metrics_path = Path(getattr(args, "metrics_path", "/tmp/fl_metrics.jsonl"))
         self._metrics_path.write_text("")   # reset on new run
@@ -115,6 +120,10 @@ class FedTrainer:
     # ------------------------------------------------------------------
 
     def train(self) -> None:
+        if self._eval_only:
+            self._run_eval_only()
+            return
+
         num_rounds = int(getattr(self.args, "num_rounds", 1))
         client_frac = float(getattr(self.args, "client_frac", 1.0))
         round_metrics: list[dict] = []
@@ -248,6 +257,41 @@ class FedTrainer:
 
         self._print_metrics_table(round_metrics)
 
+    def _run_eval_only(self) -> None:
+        """--eval-only: no training rounds, no server aggregation -- just run
+        the already-loaded (optionally checkpoint-restored) shared_model
+        against --dataset's test split once. Intended for evaluating a LoRA
+        checkpoint trained on a separate <dataset>_train pseudo-dataset
+        against this (untouched) dataset's full question set -- pair with
+        --qa-test-only at preprocess time so test_idx covers all of it, and
+        --max-eval-samples set above the question count so nothing gets
+        capped.
+        """
+        if self.shared_model is None:
+            raise RuntimeError(
+                "--eval-only requires Stage D to have initialized a model "
+                "(check the QA cache at --qa-data-root exists and matches --dataset)."
+            )
+        if not self._test_samples:
+            raise RuntimeError(
+                "--eval-only: no test samples loaded. Build the QA cache with "
+                "--qa-test-only (or check --qa-data-root points at the right cache)."
+            )
+        print(f"[eval-only] evaluating on {len(self._test_samples)} test samples "
+              f"(--max-eval-samples={getattr(self.args, 'max_eval_samples', 200)} "
+              "-- raise it if this is less than your test set size)", flush=True)
+        test_metrics = self._eval_split_acc(self._test_samples)
+        print(f"    test  : hit {test_metrics['hit']:.2f}% | "
+              f"EM {test_metrics['em']:.2f}% | F1 {test_metrics['f1']:.2f}", flush=True)
+        self._log_metrics({
+            "round": 0, "avg_loss": None, "client_losses": {}, "client_syn_mem": {},
+            "stage_b_refine": {}, "server_syn_loss": None, "client_times": {},
+            "round_time": None, "agg_time": None, "eval_time": None,
+            "train_acc": None, "val_acc": None, "test_acc": test_metrics["hit"],
+            "val_em": None, "val_f1": None,
+            "test_em": test_metrics["em"], "test_f1": test_metrics["f1"],
+        }, global_step=0)
+
     # ------------------------------------------------------------------
     # Checkpointing
     # ------------------------------------------------------------------
@@ -276,6 +320,39 @@ class FedTrainer:
         torch.save(payload, path)
         print(f"    [checkpoint] new best val hit {self._best_val_acc:.2f}% "
               f"(round {round_id}) -> {path}", flush=True)
+
+    def _load_checkpoint(self, path: str) -> None:
+        """Load a --save-best LoRA checkpoint into self.shared_model.
+
+        The model must have been built with the *same* LoRA config (rank,
+        alpha, target modules, --llm-frozen False, --dual-graph-mode) as the
+        run that produced the checkpoint, or load_state_dict(strict=False)
+        will silently attach nothing (mismatched key names).
+        """
+        if self.shared_model is None:
+            raise RuntimeError(
+                f"--load-checkpoint {path} given but Stage D never initialized "
+                "(needs --num-rounds > 1 or --eval-only, plus --llm-frozen False "
+                "to have a LoRA adapter to load into)."
+            )
+        if not has_lora(self.shared_model.model):
+            raise RuntimeError(
+                f"--load-checkpoint {path} given but the current model has no LoRA "
+                "adapter -- pass --llm-frozen False with the same --lora-rank/"
+                "--lora-alpha/--lora-target-modules used to produce this checkpoint."
+            )
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        missing, unexpected = self.shared_model.model.load_state_dict(payload["lora"], strict=False)
+        lora_missing = [k for k in missing if ".lora_A." in k or ".lora_B." in k]
+        if lora_missing:
+            raise RuntimeError(
+                f"--load-checkpoint {path}: {len(lora_missing)} LoRA keys not found in "
+                "the current model (config mismatch?) -- first few: "
+                f"{lora_missing[:5]}"
+            )
+        print(f"    [checkpoint] loaded LoRA from {path} "
+              f"(round {payload.get('round')}, val hit {payload.get('val_metrics', {}).get('hit')})",
+              flush=True)
 
     # ------------------------------------------------------------------
     # Evaluation

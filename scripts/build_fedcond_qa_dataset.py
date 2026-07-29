@@ -77,7 +77,8 @@ def _collect_passages(questions: list[dict]) -> tuple[list[list[str]], list[str]
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="hotpotqa",
-                        choices=["hotpotqa", "musique", "2wikimultihop", "medical"])
+                        choices=["hotpotqa", "musique", "2wikimultihop", "medical",
+                                 "hotpotqa_train", "musique_train", "2wikimultihop_train"])
     parser.add_argument("--top-k-desc", type=int, default=TOP_K_DESC,
                         help="Number of cosine-ranked passages to use as LLM desc")
     parser.add_argument("--out-root", default="dataset/fedcond_qa",
@@ -85,6 +86,12 @@ def main() -> None:
                              "(e.g. dataset/fedcond_qa_musique) when working with "
                              "several datasets so they don't overwrite each other; "
                              "pass the same path to fl-train via --qa-data-root.")
+    parser.add_argument("--test-only", action="store_true",
+                        help="Put all records in the test split (train/val empty) instead "
+                             "of the default 80/10/10. For a dataset that's held out purely "
+                             "for final evaluation -- e.g. after training on a separate "
+                             "<dataset>_train pseudo-dataset -- so none of its questions are "
+                             "ever used for training.")
     args = parser.parse_args()
 
     processed_root = _ROOT / "processed" / args.dataset
@@ -192,14 +199,17 @@ def main() -> None:
     (out_root / "_meta.json").write_text(json.dumps({"dataset": args.dataset}))
 
     # ------------------------------------------------------------------
-    # 4. Train / val / test splits  (80 / 10 / 10)
+    # 4. Train / val / test splits  (80 / 10 / 10, or all-test with --test-only)
     # ------------------------------------------------------------------
     n = len(records)
-    splits = {
-        "train": list(range(0, int(0.8 * n))),
-        "val":   list(range(int(0.8 * n), int(0.9 * n))),
-        "test":  list(range(int(0.9 * n), n)),
-    }
+    if args.test_only:
+        splits = {"train": [], "val": [], "test": list(range(n))}
+    else:
+        splits = {
+            "train": list(range(0, int(0.8 * n))),
+            "val":   list(range(int(0.8 * n), int(0.9 * n))),
+            "test":  list(range(int(0.9 * n), n)),
+        }
     for name, idx in splits.items():
         (out_root / "split" / f"{name}_indices.txt").write_text("\n".join(map(str, idx)))
     print(f"  splits: train={len(splits['train'])}, val={len(splits['val'])}, test={len(splits['test'])}")
