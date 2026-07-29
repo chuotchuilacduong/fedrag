@@ -45,7 +45,7 @@ SEED = 42
 RAW_NAMES = {"hotpotqa": "hotpotqa", "musique": "musique", "2wikimultihop": "2wikimultihopqa"}
 
 HF_SOURCE = {
-    "hotpotqa": {"path": "hotpot_qa", "name": "distractor", "split": "train"},
+    "hotpotqa": {"path": "hotpotqa/hotpot_qa", "name": "distractor", "split": "train"},
     "musique": {"path": "voidful/MuSiQue", "split": "train", "streaming": True},
     "2wikimultihop": {"path": "framolfese/2WikiMultihopQA", "split": "train"},
 }
@@ -196,8 +196,10 @@ def build_one(dataset: str) -> None:
 
     out_dir = OUT_ROOT / f"{dataset}_train"
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "questions.json").write_text(json.dumps(questions, ensure_ascii=False, indent=2))
-    (out_dir / "chunks.json").write_text(json.dumps(chunks, ensure_ascii=False))
+    (out_dir / "questions.json").write_text(
+        json.dumps(questions, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "chunks.json").write_text(
+        json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
     print(f"  {len(questions)} questions, {len(chunks)} unique chunks -> {out_dir}", flush=True)
 
 
