@@ -108,12 +108,25 @@ class BGEEmbeddingModel(BaseEmbeddingModel):
         if instruction:
             prompts = [instruction + text for text in prompts]
             
+        # NOTE (fedrag fork): embedding_config's max_length comes from
+        # BaseConfig.embedding_max_seq_len (default 2048, sized for BGE-M3's
+        # long-context support), used unconditionally regardless of which
+        # model this generic AutoModel/AutoTokenizer wrapper actually loaded.
+        # For this project's default embedding model (all-MiniLM-L6-v2,
+        # max_position_embeddings=512), truncating to 2048 is a no-op and a
+        # >512-token passage crashes at the position-embedding lookup
+        # ("size of tensor a (527) must match size of tensor b (512)").
+        # Cap to whatever the loaded tokenizer actually supports.
+        configured_max_length = kwargs.get("max_length", self.embedding_config.encode_params.get("max_length", 512))
+        model_max_length = getattr(self.tokenizer, "model_max_length", configured_max_length)
+        max_length = min(configured_max_length, model_max_length)
+
         with torch.no_grad():
             inputs = self.tokenizer(
-                prompts, 
-                padding=True, 
-                truncation=True, 
-                max_length=kwargs.get("max_length", self.embedding_config.encode_params.get("max_length", 512)),
+                prompts,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
                 return_tensors='pt'
             ).to(self.embedding_model.device)
             

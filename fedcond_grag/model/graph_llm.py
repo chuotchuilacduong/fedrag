@@ -82,8 +82,13 @@ class GraphLLM(torch.nn.Module):
             cpu_gib = getattr(args, "llm_cpu_max_memory_gib", None)
             if cpu_gib:
                 max_memory["cpu"] = f"{cpu_gib}GiB"
+        # device_map="auto" (even with no max_memory) still runs accelerate's
+        # device-inference machinery, which touches torch.cuda -- on this
+        # dev machine (WSL2 GPU passthrough) that crashes the process
+        # outright when no GPU should be used (CUDA_VISIBLE_DEVICES='').
+        # Skip "auto" placement entirely and go straight to CPU in that case.
         kwargs = {
-            "device_map": "auto",
+            "device_map": "auto" if n_gpus > 0 else "cpu",
             "revision": "main",
         }
         if max_memory:
@@ -139,9 +144,14 @@ class GraphLLM(torch.nn.Module):
                 BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=_cpu_offload_enabled)
                 if load_in_8bit else None
             )
+            # float16 has poor/slow CPU kernel coverage in most PyTorch
+            # builds; bfloat16 has decent native CPU support (oneDNN) and
+            # keeps the same memory footprint, so prefer it whenever no GPU
+            # is visible (e.g. a deliberate CPU-only run).
+            _cpu_dtype = torch.bfloat16 if not torch.cuda.is_available() else torch.float16
             model = AutoModelForCausalLM.from_pretrained(
                 args.llm_model_path,
-                torch_dtype=None if load_in_8bit else torch.float16,
+                torch_dtype=None if load_in_8bit else _cpu_dtype,
                 low_cpu_mem_usage=True,
                 quantization_config=quant_cfg,
                 attn_implementation=_attn_impl,
@@ -337,7 +347,14 @@ class GraphLLM(torch.nn.Module):
             attention_mask[i, pad_len:] = 1
             padded_labels.append([IGNORE_INDEX] * pad_len + batch_label_input_ids[i])
 
-        inputs_embeds = torch.stack(padded_embeds, dim=0)
+        # bos/text embeds come from word_embedding (the LLM's own dtype,
+        # e.g. float16) while graph_embeds comes from the GNN/projector
+        # (hardcoded bfloat16, see _gnn_dtype above) -- torch.cat between
+        # mixed float dtypes silently promotes to float32. On GPU this goes
+        # unnoticed because maybe_autocast() wraps the model call and CUDA
+        # autocast casts float32 inputs back down for whitelisted ops; on
+        # CPU maybe_autocast() is a no-op (see below), so cast explicitly.
+        inputs_embeds = torch.stack(padded_embeds, dim=0).to(self.word_embedding.weight.dtype)
         label_input_ids = torch.tensor(padded_labels, dtype=torch.long, device=dev)
 
         with self.maybe_autocast():
@@ -403,7 +420,9 @@ class GraphLLM(torch.nn.Module):
                 padded_embeds.append(batch_inputs_embeds[i])
             attention_mask[i, pad_len:] = 1
 
-        inputs_embeds = torch.stack(padded_embeds, dim=0)
+        # see matching comment in forward() -- mixed bf16/fp16 cat promotes
+        # to float32, which only gets fixed up for us under GPU autocast.
+        inputs_embeds = torch.stack(padded_embeds, dim=0).to(self.word_embedding.weight.dtype)
 
         with self.maybe_autocast():
             outputs = self.model.generate(

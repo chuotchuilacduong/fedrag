@@ -32,6 +32,17 @@ encoder (`all-MiniLM-L6-v2`, 384-dim) rather than GRAG's own sbert wrapper
 with the rest of the repo, and it's the embedding space the Tri-Graph
 fallback is already in. `gnn_in_dim`/`gnn_hidden_dim` are set to 384 to
 match, same as `baselines/gretriever` already does for the same reason.
+
+Train/test split: by default (`qa_train_root` unset) this trains and
+evaluates off a single `qa_data_root`'s own 80/10/10 split, same as before.
+Pass `qa_train_root` to instead train on a SEPARATE qa cache's own train
+split (built from a `<dataset>_train` pseudo-dataset via
+`scripts/download_train_split.py` + `main.py preprocess --dataset
+<dataset>_train`) while val/test still come from `qa_data_root` (built with
+`main.py preprocess --qa-test-only`, so none of its questions were ever
+seen during training) -- mirrors the same train/test separation
+`main.py fl-train --eval-only --load-checkpoint` uses for fedrag's own
+training, for a fair baseline comparison.
 """
 
 from __future__ import annotations
@@ -93,6 +104,10 @@ DEFAULT_ARGS: dict[str, Any] = dict(
     retrieval_topk=10,        # top-k seed nodes (GRAG's own `topk` default)
     retrieval_k=2,            # ego-subgraph hop radius (GRAG's own `k` default)
     retrieval_topk_entity=5,  # nodes/edges kept per seed subgraph (GRAG's own `topk_entity` default)
+    qa_data_root="dataset/fedcond_qa",
+    # If set, train on this SEPARATE root's own train split instead of
+    # qa_data_root's -- see module docstring on qa_train_root below.
+    qa_train_root="",
 )
 
 
@@ -196,10 +211,20 @@ def _load_client_graph(dataset: str, client_id: int, num_clients: int, encoder) 
 
 
 def _retrieve_sample(graph: Data, nodes_df: pd.DataFrame, edges_df: pd.DataFrame, q_emb: torch.Tensor, args: Namespace):
-    _, (subgraph, desc) = retrive_on_graphs(
+    # retrive_on_graphs's sims=None path scores every candidate seed node by
+    # extracting its k-hop subgraph and re-embedding it (GRAG's own
+    # query-conditioned relevance) -- workable for GRAG's original small
+    # task KGs (WebQSP: dozens/hundreds of nodes) but O(graph.num_nodes)
+    # subgraph extractions per question here, where the Tri-Graph fallback
+    # has tens of thousands of nodes. Precompute a cheap node-embedding
+    # cosine similarity and pass it as `sims` instead, which sends this
+    # down the intended fast path (`find_topk_subgraph`) that only ever
+    # extracts a subgraph for the `retrieval_topk` seed nodes.
+    sims = torch.nn.functional.cosine_similarity(q_emb.unsqueeze(0), graph.x)
+    subgraph, desc = retrive_on_graphs(
         graph, q_emb, nodes_df, edges_df,
         topk=args.retrieval_topk, k=args.retrieval_k, topk_entity=args.retrieval_topk_entity,
-        augment="none",
+        augment="none", sims=sims,
     )
     return subgraph, desc
 
@@ -243,20 +268,34 @@ def run_client_baseline(
     encoder = load_encoder(DEFAULT_MODEL)
     graph, nodes_df, edges_df, graph_source = _load_client_graph(dataset, client_id, num_clients, encoder)
 
-    qa_dataset = FedCondQADataset(root="dataset/fedcond_qa")
+    qa_dataset = FedCondQADataset(root=args.qa_data_root)
     idx_split = qa_dataset.get_idx_split()
-    train_idx = [i for i in idx_split["train"] if i % num_clients == client_id]
     max_eval = int(args.max_eval_samples)
     max_train = int(args.max_train_samples)
-    if max_train > 0:
-        train_idx = train_idx[:max_train]
-    val_idx = idx_split["val"][:max_eval]
-    test_idx = idx_split["test"][:max_eval]
 
-    def _prepare(idx_list) -> list[dict]:
+    if args.qa_train_root:
+        # Separate train/test qa caches -- see module docstring. Train
+        # samples come from qa_train_root's own train split; val/test come
+        # from qa_data_root's test split (val is empty when qa_data_root was
+        # built with --qa-test-only, so test doubles as val here too).
+        train_qa_dataset = FedCondQADataset(root=args.qa_train_root)
+        train_idx = [i for i in train_qa_dataset.get_idx_split()["train"] if i % num_clients == client_id]
+        if max_train > 0:
+            train_idx = train_idx[:max_train]
+        eval_idx = idx_split["test"][:max_eval]
+        val_idx = test_idx = eval_idx
+    else:
+        train_qa_dataset = qa_dataset
+        train_idx = [i for i in idx_split["train"] if i % num_clients == client_id]
+        if max_train > 0:
+            train_idx = train_idx[:max_train]
+        val_idx = idx_split["val"][:max_eval]
+        test_idx = idx_split["test"][:max_eval]
+
+    def _prepare(idx_list, source_dataset) -> list[dict]:
         prepared = []
         for i in idx_list:
-            row = qa_dataset[i]
+            row = source_dataset[i]
             # Prefer the dataset's own precomputed embedding (raw question
             # text, all-MiniLM-L6-v2, built by scripts/build_fedcond_qa_dataset.py)
             # over re-embedding row["question"], which is already wrapped in
@@ -272,9 +311,9 @@ def run_client_baseline(
                               "desc": desc, "graph": subgraph})
         return prepared
 
-    train_samples = _prepare(train_idx)
-    val_samples = _prepare(val_idx)
-    test_samples = _prepare(test_idx)
+    train_samples = _prepare(train_idx, train_qa_dataset)
+    val_samples = _prepare(val_idx, qa_dataset)
+    test_samples = _prepare(test_idx, qa_dataset)
 
     llm_path = args.llm_model_path or llama_model_path.get(args.llm_model_name, "")
     if not llm_path:

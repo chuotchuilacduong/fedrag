@@ -171,22 +171,28 @@ def merge_graphs(graph_list, q_emb):
     return merge_graph
 
 def find_topk_subgraph(graph, q_emb, top_k_indices, edges_mapping, textual_nodes, textual_edges, k, topk_entity):
+    # `edges_mapping` is a list of (src, dst) pairs, index-aligned with
+    # graph.edge_index/edge_attr -- build the dict version once so edge
+    # lookups below are O(1) instead of O(num_edges) `list.index()`/`in`
+    # scans repeated per node (matches the pattern already used by
+    # get_trunk_triplets/get_augmented_triplets/get_augmented_path in this
+    # same file).
+    edges_mapping_dict = {pair: idx for idx, pair in enumerate(edges_mapping)}
     topk_graph, topk_desc = [], ""
     for node_id in top_k_indices:
         try:
             subgraph_nodes, subgraph_edge_indices, _, _ = k_hop_subgraph(
-                node_idx=node_id, 
-                num_hops=k, 
-                edge_index=graph.edge_index, 
+                node_idx=node_id,
+                num_hops=k,
+                edge_index=graph.edge_index,
                 relabel_nodes=False
             )
 
             if graph.edge_attr.dim() == 2:
                 if subgraph_edge_indices.size(1) == 0: subgraph_edge_attr = None
-                else: 
+                else:
                     subgraph_edge_index = subgraph_edge_indices.T.tolist()
-                    graph_edge_index = graph.edge_index.T.tolist()
-                    indices = torch.tensor([graph_edge_index.index(pair) for pair in subgraph_edge_index])
+                    indices = torch.tensor([edges_mapping_dict[tuple(pair)] for pair in subgraph_edge_index])
                     subgraph_edge_attr = graph.edge_attr[indices]
             else: 
                 subgraph_edge_attr = graph.edge_attr[subgraph_edge_indices]
@@ -225,7 +231,7 @@ def find_topk_subgraph(graph, q_emb, top_k_indices, edges_mapping, textual_nodes
                     top_k_edges = torch.arange(sim_edges.shape[1]).tolist()
 
             # Use hard_promt() if you would like to achieve a lossless graph textual description here.
-            subgraph_edge_indices = [edges_mapping.index((src, dst)) for _, (src, dst) in enumerate(subgraph.edge_index.T.numpy()) if (src, dst) in edges_mapping]
+            subgraph_edge_indices = [edges_mapping_dict[(src, dst)] for _, (src, dst) in enumerate(subgraph.edge_index.T.numpy()) if (src, dst) in edges_mapping_dict]
             subedges_desc = textual_edges.iloc[subgraph_edge_indices].iloc[top_k_edges]
             topk_desc += subnodes_desc.to_csv(index=False)+ '\n' + subedges_desc.to_csv(index=False, columns=['src', 'edge_attr', 'dst']) + '\n'
 

@@ -2,7 +2,7 @@ import contextlib
 import torch
 import torch.nn as nn
 from torch.cuda.amp import autocast as autocast
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from torch_scatter import scatter
 from src.model.gnn import load_gnn_model
 from peft import (
@@ -33,21 +33,63 @@ class GraphLLM(torch.nn.Module):
         # (0-3, 20GiB each). Build it from the GPUs actually present instead
         # -- unchanged behavior on their 4-GPU setup, works on this
         # project's single-GPU one too (some accelerate versions error on
-        # max_memory keys for devices that don't exist).
-        kwargs = {
-            "max_memory": {i: '20GiB' for i in range(max(torch.cuda.device_count(), 1))},
-            "device_map": "auto",
-            "revision": "main",
-        }
+        # max_memory keys for devices that don't exist). When no GPU is
+        # visible at all (e.g. CUDA_VISIBLE_DEVICES='' to force a CPU run),
+        # `device_map="auto"` + a `max_memory={0: ...}` map still tries to
+        # resolve accelerator device 0 and crashes -- use device_map="cpu"
+        # instead in that case.
+        if torch.cuda.is_available():
+            kwargs = {
+                "max_memory": {i: '20GiB' for i in range(torch.cuda.device_count())},
+                "device_map": "auto",
+                "revision": "main",
+            }
+        else:
+            kwargs = {"device_map": "cpu", "revision": "main"}
 
         self.tokenizer = AutoTokenizer.from_pretrained(args.llm_model_path, use_fast=False, revision=kwargs["revision"])
         self.tokenizer.pad_token_id = 0
         self.tokenizer.padding_side = 'left'
 
+        # NOTE (fedrag fork): the cuDNN SDPA backend (newer torch versions)
+        # throws "No execution plans support the graph" on some GPU/cuDNN
+        # combinations -- same workaround as this project's own
+        # fedcond_grag/model/graph_llm.py.
+        if torch.cuda.is_available() and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            torch.backends.cuda.enable_cudnn_sdp(False)
+
+        # NOTE (fedrag fork): upstream never supported 4-bit loading at all
+        # (always torch_dtype=float16), which doesn't fit qwen2.5-7b on an
+        # 8GB GPU without accelerate's slow/fragile automatic CPU offload.
+        # Mirrors this project's own fedcond_grag/model/graph_llm.py.
+        load_in_4bit = bool(getattr(args, "llm_load_in_4bit", False))
+        quant_cfg = (
+            BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+            if load_in_4bit else None
+        )
+        # float16 matmul on CPU is unsupported/very slow in most PyTorch
+        # builds. float32 would need ~30GB just for qwen2.5-7b's weights --
+        # more than this dev machine's RAM. bfloat16 has decent native CPU
+        # kernel coverage (oneDNN) and halves that to ~15GB, so use it for
+        # CPU-only runs (accepted trade-off: slower per-step, but fits and
+        # is numerically well-supported).
+        if load_in_4bit:
+            _dtype = None
+        elif torch.cuda.is_available():
+            _dtype = torch.float16
+        else:
+            _dtype = torch.bfloat16
         model = AutoModelForCausalLM.from_pretrained(
             args.llm_model_path,
-            torch_dtype=torch.float16,
+            torch_dtype=_dtype,
             low_cpu_mem_usage=True,
+            quantization_config=quant_cfg,
+            attn_implementation="sdpa",
             **kwargs
         )
 
@@ -144,7 +186,7 @@ class GraphLLM(torch.nn.Module):
 
         # encode graphs
         graph_embeds = self.encode_graphs(samples)
-        graph_embeds = self.projector(graph_embeds)
+        graph_embeds = self.projector(graph_embeds).to(self.word_embedding.weight.dtype)
 
         batch_size = len(samples['id'])
         batch_inputs_embeds = []
@@ -199,7 +241,7 @@ class GraphLLM(torch.nn.Module):
 
         # encode graphs
         graph_embeds = self.encode_graphs(samples)
-        graph_embeds = self.projector(graph_embeds)
+        graph_embeds = self.projector(graph_embeds).to(self.word_embedding.weight.dtype)
 
         batch_size = len(samples['id'])
         batch_inputs_embeds = []

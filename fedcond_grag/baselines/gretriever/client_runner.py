@@ -27,6 +27,19 @@ Prerequisites (same as the main federated pipeline):
     python main.py preprocess --dataset <dataset> --num-clients <N>
     python scripts/build_fedcond_qa_dataset.py --dataset <dataset>
     python scripts/preprocess_fedcond_qa.py --dataset <dataset>
+
+Train/test split: by default (`qa_train_root` unset) this trains and
+evaluates off a single `<dataset>` trigraph + qa cache's own 80/10/10 split,
+same as before. Pass `qa_train_root` to instead train on a SEPARATE
+`<dataset>_train` pseudo-dataset (built via `scripts/download_train_split.py`
++ `main.py preprocess --dataset <dataset>_train`) -- its own trigraph, own
+per-client PPR node map, own qa cache -- while eval still runs against
+`<dataset>`'s own trigraph/qa cache (built with `main.py preprocess
+--qa-test-only`, so none of its questions were ever seen during training).
+The trained model's weights transfer directly (`set_shared_model` on both
+clients); only the graph/evidence-retrieval context differs between the two
+phases. Mirrors `main.py fl-train --eval-only --load-checkpoint`'s split for
+fedrag's own training, for a fair baseline comparison.
 """
 
 from __future__ import annotations
@@ -45,6 +58,10 @@ _ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_ARGS: dict[str, Any] = dict(
     data_root="processed",
     qa_data_root="dataset/fedcond_qa",
+    # If set, train on this SEPARATE <dataset>_train pseudo-dataset's own
+    # trigraph/qa-cache/PPR-map instead of qa_data_root's -- see module
+    # docstring.
+    qa_train_root="",
     llm_model_name="qwen2.5-1.5b",
     llm_model_path="",
     llm_frozen="True",
@@ -159,39 +176,62 @@ def run_client_baseline(
     args = _build_args(dataset, num_clients, arg_overrides)
     processed_root = _ROOT / args.data_root
 
-    data, data_dir = _load_client_trigraph(processed_root, dataset, client_id)
-    client = FedCondQAClient(args, client_id, data, data_dir, message_pool={}, device=device)
-    num_docs = int(getattr(data, "num_nodes", data.x.size(0)))
+    # Separate train/test: train against <dataset>_train's own trigraph/PPR
+    # map (built via 'main.py preprocess --dataset <dataset>_train'), eval
+    # against <dataset>'s -- see module docstring. Without qa_train_root,
+    # both phases share the same client/graph, exactly as before.
+    train_dataset_name = f"{dataset}_train" if args.qa_train_root else dataset
+    train_data, train_data_dir = _load_client_trigraph(processed_root, train_dataset_name, client_id)
+    train_client = FedCondQAClient(args, client_id, train_data, train_data_dir, message_pool={}, device=device)
 
-    qa_dataset = FedCondQADataset(root=args.qa_data_root, top_r_passages=args.top_r_passages,
-                                   top_r_anchor=args.top_r_anchor)
-    idx_split = qa_dataset.get_idx_split()
-    train_idx = [i for i in idx_split["train"] if i % num_clients == client_id]
-    max_eval = int(args.max_eval_samples)
-    val_samples = [qa_dataset[i] for i in idx_split["val"][:max_eval]]
-    test_samples = [qa_dataset[i] for i in idx_split["test"][:max_eval]]
+    if args.qa_train_root:
+        eval_data, eval_data_dir = _load_client_trigraph(processed_root, dataset, client_id)
+        eval_client = FedCondQAClient(args, client_id, eval_data, eval_data_dir, message_pool={}, device=device)
+    else:
+        eval_data, eval_client = train_data, train_client
+    num_docs = int(getattr(eval_data, "num_nodes", eval_data.x.size(0)))
+
+    train_qa_dataset = FedCondQADataset(root=args.qa_train_root or args.qa_data_root,
+                                         top_r_passages=args.top_r_passages, top_r_anchor=args.top_r_anchor)
+    train_idx = [i for i in train_qa_dataset.get_idx_split()["train"] if i % num_clients == client_id]
     max_train = int(getattr(args, "max_train_samples", 0))
     if max_train > 0:
         train_idx = train_idx[:max_train]
-    train_samples = [qa_dataset[i] for i in train_idx]
+    train_samples = [train_qa_dataset[i] for i in train_idx]
+
+    max_eval = int(args.max_eval_samples)
+    if args.qa_train_root:
+        eval_qa_dataset = FedCondQADataset(root=args.qa_data_root, top_r_passages=args.top_r_passages,
+                                            top_r_anchor=args.top_r_anchor)
+        eval_idx = eval_qa_dataset.get_idx_split()["test"][:max_eval]
+        val_samples = test_samples = [eval_qa_dataset[i] for i in eval_idx]
+    else:
+        eval_qa_dataset = train_qa_dataset
+        idx_split = eval_qa_dataset.get_idx_split()
+        val_samples = [eval_qa_dataset[i] for i in idx_split["val"][:max_eval]]
+        test_samples = [eval_qa_dataset[i] for i in idx_split["test"][:max_eval]]
 
     model = _load_model(args, device)
-    client.set_shared_model(model)
-    client.set_local_qa_data(train_samples)
+    train_client.set_shared_model(model)
+    train_client.set_local_qa_data(train_samples)
 
     trainable = list(model.graph_encoder.parameters()) + list(model.projector.parameters())
     optimizer = torch.optim.AdamW(trainable, lr=args.local_lr, weight_decay=args.local_wd, betas=(0.9, 0.95))
-    client._optimizer = optimizer
+    train_client._optimizer = optimizer
 
-    total_loss, total_steps = 0.0, 0
-    for _ in range(int(args.local_epochs)):
-        loss, steps = client.local_train()
-        total_loss += loss * steps
-        total_steps += steps
-    avg_train_loss = total_loss / total_steps if total_steps else None
+    # train_client.local_train() already loops over args.local_epochs
+    # internally (see fedcond_grag/client/client.py) -- call it once, not in
+    # a loop. A previous version of this file called it local_epochs times,
+    # each call itself running local_epochs epochs and reloading the
+    # pre-training snapshot via _load_weights_into_model() first, so it
+    # trained local_epochs**2 epochs total while the last call's reload
+    # discarded every earlier call's progress -- purely wasted compute.
+    avg_train_loss, total_steps = train_client.local_train()
 
-    val_metrics = _eval_client(client, model, val_samples, args)
-    test_metrics = _eval_client(client, model, test_samples, args)
+    # eval_client shares the just-trained model (weights transfer directly;
+    # only the graph/evidence-retrieval context can differ from train_client).
+    val_metrics = _eval_client(eval_client, model, val_samples, args)
+    test_metrics = _eval_client(eval_client, model, test_samples, args)
 
     return {
         "dataset": dataset,

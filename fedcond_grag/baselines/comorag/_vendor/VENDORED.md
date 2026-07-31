@@ -78,6 +78,20 @@ correctly given the `src/` layout, so that file needed no direct patch here.
    initializing both dicts to `{}` in the empty-store branch, matching what
    the loaded-branch does for the equivalent empty case.
 
+6. `embedding_model/BGEEmbedding.py::_encode()` truncated to
+   `BaseConfig.embedding_max_seq_len` (default 2048, sized for BGE-M3's own
+   long-context support) regardless of what the loaded tokenizer/model
+   actually supports. With this project's default embedding model
+   (all-MiniLM-L6-v2, `max_position_embeddings=512`), that made truncation
+   a no-op past 512 tokens -- any single passage/chunk/summary longer than
+   512 tokens crashed at the position-embedding lookup (`RuntimeError: The
+   size of tensor a (N) must match the size of tensor b (512)`; deviation 5
+   above hit this exact error from a too-long timeline summary and patched
+   around one downstream symptom of it, but the root cause -- and its
+   ordinary-passage-indexing case, hit indexing hotpotqa's own corpus --
+   remained). Fixed by capping to `min(configured_max_length,
+   self.tokenizer.model_max_length)`.
+
 Note: going through `BGEEmbeddingModel` with a non-BGE model name
 (`all-MiniLM-L6-v2`, chosen for consistency with the rest of this project)
 means every input gets BGE's hardcoded instruction prefix ("Generate a

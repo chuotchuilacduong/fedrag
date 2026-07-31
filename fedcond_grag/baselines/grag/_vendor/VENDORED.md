@@ -60,6 +60,51 @@ runtime (`torch.cuda.device_count()`, `self.model.config.hidden_size`) so
 this works with any local LLM/GPU count, e.g. this project's Qwen2.5
 checkpoints (hidden_size=1536) on a single GPU.
 
+**Deviation 4:** `utils/graph_retrieval.py::find_topk_subgraph()` rebuilt
+`graph.edge_index.T.tolist()` and did a Python `list.index()`/`in` scan over
+it *per edge, per candidate node* to map an (src, dst) pair back to its
+position in `graph.edge_attr` -- O(num_edges) per lookup. Harmless for
+GRAG's own small task KGs but pathological against this project's Tri-Graph
+fallback (tens of thousands of edges): with `client_runner.py::_retrieve_sample`
+also not passing `sims` (see below), a single retrieval call iterated
+*every node in the graph* doing this, taking upwards of an hour for one
+query. Patched to build the (src, dst) -> edge-index dict once per call
+(same pattern already used by `get_trunk_triplets`/`get_augmented_triplets`/
+`get_augmented_path` elsewhere in this file) instead of re-deriving it with
+a linear scan each time; output is identical, just no longer quadratic.
+`client_runner.py::_retrieve_sample` was also fixed to pass a cheap
+node-embedding cosine-similarity `sims` into `retrive_on_graphs`, which was
+always called with `sims=None` -- that put every query down the
+O(graph.num_nodes) "score every node's own subgraph" path instead of the
+intended O(retrieval_topk) `find_topk_subgraph` fast path.
+
+**Deviation 5:** `model/graph_llm.py::__init__` always loaded the LLM as
+`torch_dtype=torch.float16` with no quantization option at all, unlike this
+project's own `fedcond_grag/model/graph_llm.py` -- qwen2.5-7b in fp16 (~15GB)
+doesn't fit an 8GB GPU without accelerate's automatic (slow, and here
+outright broken -- see below) CPU offload. Patched to add the same
+`llm_load_in_4bit` bitsandbytes path as this project's own model, and the
+same `torch.backends.cuda.enable_cudnn_sdp(False)` workaround (newer torch
+versions' cuDNN SDPA backend throws "No execution plans support the graph"
+on some GPU/cuDNN combinations -- hit exactly this running the fp16+CPU-offload
+path on this project's dev GPU before the 4-bit patch was added).
+
+**Deviation 6:** `model/graph_llm.py::forward()`/`inference()` concatenate
+`graph_embeds` (float32 -- `self.graph_encoder`/`self.projector` are plain
+`nn.Module`s, only ever moved with `.to(device)`, never cast to the LLM's
+dtype) with `bos_embeds`/`inputs_embeds` (whatever dtype the LLM was
+loaded in) into one `inputs_embeds` tensor. On GPU this went unnoticed
+(`maybe_autocast()` wraps the *following* `self.model(...)` call in
+`torch.cuda.amp.autocast`, which is lenient enough about mixed float32/fp16
+inputs to whitelisted ops). `maybe_autocast()` explicitly disables autocast
+on CPU (`enable_autocast = self.device != torch.device("cpu")`), so a CPU
+run hits a hard `RuntimeError: mat1 and mat2 must have the same dtype, but
+got Float and BFloat16` the moment the mismatched `inputs_embeds` reaches
+the first attention projection. Patched both call sites to
+`.to(self.word_embedding.weight.dtype)` right after `self.projector(...)`,
+so `graph_embeds` always matches the LLM's embedding dtype regardless of
+device/dtype config.
+
 See `fedcond_grag/baselines/grag/client_runner.py` for how this package is
 driven: per-client, reusing this project's own Tri-Graph (or HippoRAG's
 cached OpenIE triples when available -- see that file's module docstring),

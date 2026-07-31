@@ -53,6 +53,18 @@ def main() -> None:
     parser.add_argument("--retrieval_k", type=int, default=2)
     parser.add_argument("--retrieval_topk_entity", type=int, default=5)
     parser.add_argument("--use_cuda", action="store_true")
+    parser.add_argument("--llm_load_in_4bit", action="store_true",
+                         help="Quantize the local LLM to 4-bit (bitsandbytes) -- needed for qwen2.5-7b on <16GB VRAM")
+    parser.add_argument("--qa_data_root", default="dataset/fedcond_qa",
+                         help="QA cache used for val/test (and, without --qa_train_root, train too). "
+                              "Build via 'main.py preprocess --dataset <dataset> --qa-out-root <root>'.")
+    parser.add_argument("--qa_train_root", default="",
+                         help="If set, train on this SEPARATE qa cache's own train split instead of "
+                              "--qa_data_root's -- e.g. a <dataset>_train pseudo-dataset built via "
+                              "scripts/download_train_split.py + 'main.py preprocess --dataset "
+                              "<dataset>_train --qa-out-root <this>'. Pair with --qa_data_root built "
+                              "via 'main.py preprocess --qa-test-only' so none of val/test's questions "
+                              "were ever seen during training.")
     args = parser.parse_args()
 
     device = "cuda" if args.use_cuda and torch.cuda.is_available() else "cpu"
@@ -61,6 +73,7 @@ def main() -> None:
         llm_model_name=args.llm_model_name,
         llm_model_path=args.llm_model_path,
         llm_frozen=args.llm_frozen,
+        llm_load_in_4bit=args.llm_load_in_4bit,
         gnn_model_name=args.gnn_model_name,
         local_epochs=args.local_epochs,
         local_batch_size=args.local_batch_size,
@@ -70,6 +83,8 @@ def main() -> None:
         retrieval_topk=args.retrieval_topk,
         retrieval_k=args.retrieval_k,
         retrieval_topk_entity=args.retrieval_topk_entity,
+        qa_data_root=args.qa_data_root,
+        qa_train_root=args.qa_train_root,
     )
 
     if args.client is not None:
