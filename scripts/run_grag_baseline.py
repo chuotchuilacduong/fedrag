@@ -31,6 +31,7 @@ sys.path.insert(0, str(_ROOT))
 import torch
 
 from fedcond_grag.baselines.grag.client_runner import run_all_clients, run_client_baseline
+from fedcond_grag.baselines.wandb_logging import log_baseline_result
 
 
 def main() -> None:
@@ -90,10 +91,12 @@ def main() -> None:
     if args.client is not None:
         result = run_client_baseline(args.dataset, args.client, args.num_clients, **common_kwargs)
         print(json.dumps(result, indent=2))
+        log_baseline_result("grag", args.dataset, result)
     else:
         summary = run_all_clients(args.dataset, args.num_clients, **common_kwargs)
         print(f"\n=== {args.dataset}: mean over {args.num_clients} clients ===")
         print(json.dumps(summary["mean"], indent=2))
+        log_baseline_result("grag", args.dataset, summary)
 
 
 if __name__ == "__main__":

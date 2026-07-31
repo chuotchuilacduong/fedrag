@@ -28,6 +28,7 @@ from fedcond_grag.baselines.comorag.client_runner import (
     run_all_clients,
     run_client_baseline,
 )
+from fedcond_grag.baselines.wandb_logging import log_baseline_result
 
 
 def main() -> None:
@@ -59,10 +60,12 @@ def main() -> None:
         if args.client is not None:
             result = run_client_baseline(dataset, args.client, args.num_clients, **common_kwargs)
             print(json.dumps(result, indent=2))
+            log_baseline_result("comorag", dataset, result)
         else:
             summary = run_all_clients(dataset, args.num_clients, **common_kwargs)
             print(f"\n=== {dataset}: mean over {args.num_clients} clients ===")
             print(json.dumps(summary["mean"], indent=2))
+            log_baseline_result("comorag", dataset, summary)
 
 
 if __name__ == "__main__":
