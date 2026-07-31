@@ -66,6 +66,13 @@ def main() -> None:
                               "<dataset>_train --qa-out-root <this>'. Pair with --qa_data_root built "
                               "via 'main.py preprocess --qa-test-only' so none of val/test's questions "
                               "were ever seen during training.")
+    parser.add_argument("--load_checkpoint", default="",
+                         help="Load a fedrag 'main.py fl-train --save-best' LoRA checkpoint as a frozen "
+                              "backbone before training -- requires --llm_frozen False, and the checkpoint's "
+                              "LoRA rank/alpha/target_modules must match grag's defaults (r=8, alpha=16, "
+                              "[q_proj, v_proj]), i.e. a run that didn't override --lora-rank/--lora-alpha/"
+                              "--lora-target-modules. Since grag/gretriever only ever train graph_encoder/"
+                              "projector (never the LLM), this LoRA stays frozen throughout.")
     args = parser.parse_args()
 
     device = "cuda" if args.use_cuda and torch.cuda.is_available() else "cpu"
@@ -86,6 +93,7 @@ def main() -> None:
         retrieval_topk_entity=args.retrieval_topk_entity,
         qa_data_root=args.qa_data_root,
         qa_train_root=args.qa_train_root,
+        load_checkpoint=args.load_checkpoint,
     )
 
     if args.client is not None:

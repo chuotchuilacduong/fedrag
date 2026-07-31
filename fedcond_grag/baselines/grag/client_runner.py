@@ -108,6 +108,10 @@ DEFAULT_ARGS: dict[str, Any] = dict(
     # If set, train on this SEPARATE root's own train split instead of
     # qa_data_root's -- see module docstring on qa_train_root below.
     qa_train_root="",
+    # If set, load a fedrag `--save-best` LoRA checkpoint as a frozen
+    # backbone before training -- see fedcond_grag/baselines/checkpoint_utils.py.
+    # Requires llm_frozen=False (adds the LoRA structure to load into).
+    load_checkpoint="",
 )
 
 
@@ -321,6 +325,9 @@ def run_client_baseline(
     args.llm_model_path = llm_path
 
     model = GraphLLM(args)
+    if args.load_checkpoint:
+        from fedcond_grag.baselines.checkpoint_utils import load_lora_checkpoint
+        load_lora_checkpoint(model.model, args.load_checkpoint)
     for name, param in model.named_parameters():
         param.requires_grad = any(name.startswith(k) for k in ("graph_encoder", "projector"))
     if not hasattr(model, "hf_device_map"):

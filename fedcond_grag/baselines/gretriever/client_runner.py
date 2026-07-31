@@ -62,6 +62,10 @@ DEFAULT_ARGS: dict[str, Any] = dict(
     # trigraph/qa-cache/PPR-map instead of qa_data_root's -- see module
     # docstring.
     qa_train_root="",
+    # If set, load a fedrag `--save-best` LoRA checkpoint as a frozen
+    # backbone before training -- see fedcond_grag/baselines/checkpoint_utils.py.
+    # Requires llm_frozen=False (adds the LoRA structure to load into).
+    load_checkpoint="",
     llm_model_name="qwen2.5-1.5b",
     llm_model_path="",
     llm_frozen="True",
@@ -124,6 +128,9 @@ def _load_model(args: Namespace, device: torch.device):
     args.llm_model_path = llm_path
 
     model = load_model["graph_llm"](args=args)
+    if getattr(args, "load_checkpoint", ""):
+        from fedcond_grag.baselines.checkpoint_utils import load_lora_checkpoint
+        load_lora_checkpoint(model.model, args.load_checkpoint)
     for name, param in model.named_parameters():
         param.requires_grad = any(name.startswith(k) for k in ("graph_encoder", "projector"))
     if not hasattr(model, "hf_device_map"):
