@@ -296,15 +296,28 @@ class FedTrainer:
     # Checkpointing
     # ------------------------------------------------------------------
 
+    # Graph-side submodules FedAvg'd server-side each round (see
+    # FedCondQAServer._fedavg_model_weights's own _WEIGHT_KEYS) -- saved/
+    # loaded here whenever the run actually trained them (--dual-graph-mode
+    # != none) regardless of whether the LLM itself is frozen.
+    _GRAPH_WEIGHT_KEYS = ("graph_encoder", "projector", "condensed_encoder", "projector_c")
+
     def _save_checkpoint(self, round_id: int, val_metrics: dict, test_metrics: dict | None) -> None:
-        """Persist only the LoRA adapter (LLM fine-tune) — the graph encoder/
-        projector are not saved here, matching text-only-question LoRA runs
-        (--dual-graph-mode none) where the graph model is never trained.
+        """Persist whatever this run actually trained: the LoRA adapter (LLM
+        fine-tune, --llm-frozen False) and/or the FedAvg'd graph_encoder/
+        projector/condensed_encoder/projector_c (--llm-frozen True is the
+        common case -- those are the only thing training then).
         """
         model = self.shared_model
-        if not has_lora(model.model):
-            print("    [checkpoint] skipped -- no LoRA adapter present "
-                  "(pass --llm-frozen False)", flush=True)
+        graph_state = {
+            key: state for key, state in (getattr(self.server, "global_model_state", None) or {}).items()
+            if key in self._GRAPH_WEIGHT_KEYS
+        }
+        model_has_lora = has_lora(model.model)
+        if not model_has_lora and not graph_state:
+            print("    [checkpoint] skipped -- no LoRA adapter and no trained graph "
+                  "weights (--dual-graph-mode none with --llm-frozen True has nothing "
+                  "to save)", flush=True)
             return
         payload = {
             "round": round_id,
@@ -312,46 +325,67 @@ class FedTrainer:
             "test_metrics": dict(test_metrics) if test_metrics else None,
             "dataset": getattr(self.args, "dataset", None),
             "lora_agg_method": getattr(self.args, "lora_agg_method", None),
-            "lora": lora_state_dict(model.model),
+            **({"lora": lora_state_dict(model.model)} if model_has_lora else {}),
+            **graph_state,
         }
 
         path = Path(self._save_best_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(payload, path)
+        saved = [k for k in ("lora", *self._GRAPH_WEIGHT_KEYS) if k in payload]
         print(f"    [checkpoint] new best val hit {self._best_val_acc:.2f}% "
-              f"(round {round_id}) -> {path}", flush=True)
+              f"(round {round_id}, saved: {saved}) -> {path}", flush=True)
 
     def _load_checkpoint(self, path: str) -> None:
-        """Load a --save-best LoRA checkpoint into self.shared_model.
+        """Load a --save-best checkpoint (LoRA adapter and/or graph_encoder/
+        projector/condensed_encoder/projector_c, whichever it contains) into
+        self.shared_model.
 
-        The model must have been built with the *same* LoRA config (rank,
-        alpha, target modules, --llm-frozen False, --dual-graph-mode) as the
-        run that produced the checkpoint, or load_state_dict(strict=False)
-        will silently attach nothing (mismatched key names).
+        The model must have been built with the *same* config (LoRA rank/
+        alpha/target-modules if --llm-frozen False, --dual-graph-mode/
+        --gnn-* dims for the graph submodules) as the run that produced the
+        checkpoint, or load_state_dict(strict=False) will silently attach
+        nothing (mismatched key names/shapes).
         """
         if self.shared_model is None:
             raise RuntimeError(
                 f"--load-checkpoint {path} given but Stage D never initialized "
-                "(needs --num-rounds > 1 or --eval-only, plus --llm-frozen False "
-                "to have a LoRA adapter to load into)."
-            )
-        if not has_lora(self.shared_model.model):
-            raise RuntimeError(
-                f"--load-checkpoint {path} given but the current model has no LoRA "
-                "adapter -- pass --llm-frozen False with the same --lora-rank/"
-                "--lora-alpha/--lora-target-modules used to produce this checkpoint."
+                "(needs --num-rounds > 1 or --eval-only)."
             )
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        missing, unexpected = self.shared_model.model.load_state_dict(payload["lora"], strict=False)
-        lora_missing = [k for k in missing if ".lora_A." in k or ".lora_B." in k]
-        if lora_missing:
-            raise RuntimeError(
-                f"--load-checkpoint {path}: {len(lora_missing)} LoRA keys not found in "
-                "the current model (config mismatch?) -- first few: "
-                f"{lora_missing[:5]}"
-            )
-        print(f"    [checkpoint] loaded LoRA from {path} "
-              f"(round {payload.get('round')}, val hit {payload.get('val_metrics', {}).get('hit')})",
+        loaded: list[str] = []
+
+        if "lora" in payload:
+            if not has_lora(self.shared_model.model):
+                raise RuntimeError(
+                    f"--load-checkpoint {path} has a LoRA adapter but the current model "
+                    "has none -- pass --llm-frozen False with the same --lora-rank/"
+                    "--lora-alpha/--lora-target-modules used to produce this checkpoint."
+                )
+            missing, _ = self.shared_model.model.load_state_dict(payload["lora"], strict=False)
+            lora_missing = [k for k in missing if ".lora_A." in k or ".lora_B." in k]
+            if lora_missing:
+                raise RuntimeError(
+                    f"--load-checkpoint {path}: {len(lora_missing)} LoRA keys not found in "
+                    f"the current model (config mismatch?) -- first few: {lora_missing[:5]}"
+                )
+            loaded.append("lora")
+
+        for key in self._GRAPH_WEIGHT_KEYS:
+            if key not in payload:
+                continue
+            submodule = getattr(self.shared_model, key, None)
+            if submodule is None:
+                raise RuntimeError(
+                    f"--load-checkpoint {path} has '{key}' weights but the current model "
+                    f"has no '{key}' submodule -- check --dual-graph-mode matches the run "
+                    "that produced this checkpoint."
+                )
+            submodule.load_state_dict(payload[key])
+            loaded.append(key)
+
+        print(f"    [checkpoint] loaded {loaded} from {path} "
+              f"(round {payload.get('round')}, val hit {(payload.get('val_metrics') or {}).get('hit')})",
               flush=True)
 
     # ------------------------------------------------------------------

@@ -313,21 +313,25 @@ def _run_fl_train(argv: list[str]) -> int:
     p.add_argument("--wandb-group", dest="wandb_group", default=None,
                    help="WandB group name for grouping related runs.")
     p.add_argument("--save-best", dest="save_best", action="store_true",
-                   help="Save the LoRA adapter (only, not the graph encoder/projector or "
-                        "frozen LLM backbone) whenever val hit%% improves. Requires "
-                        "--llm-frozen False. Off by default -- pass this to opt in, e.g. "
-                        "so the fine-tuned LLM can be reused as the base model for other "
-                        "baseline RAG methods.")
+                   help="Save whatever this run actually trained -- the LoRA adapter "
+                        "(--llm-frozen False) and/or the FedAvg'd graph_encoder/projector/"
+                        "condensed_encoder/projector_c (the common --llm-frozen True case) "
+                        "-- whenever val hit%% improves. Off by default -- pass this to opt "
+                        "in, e.g. so the trained model can be reused as the base for "
+                        "--eval-only against a held-out test set, or as a frozen backbone "
+                        "for other baseline RAG methods.")
     p.add_argument("--save-best-path", dest="save_best_path", default=None,
                    help="Where to write the checkpoint from --save-best. Defaults to "
                         "checkpoints/<dataset>/<lora-agg-method>/best.pt when --save-best "
                         "is set without an explicit path.")
     p.add_argument("--load-checkpoint", dest="load_checkpoint", default=None,
-                   help="Load a --save-best LoRA checkpoint into the model before "
-                        "training/eval. Must be paired with --llm-frozen False and the "
-                        "same --lora-rank/--lora-alpha/--lora-target-modules/"
-                        "--dual-graph-mode used to produce it, or the adapter's key "
-                        "names won't line up.")
+                   help="Load a --save-best checkpoint into the model before training/eval "
+                        "-- whichever of LoRA / graph_encoder / projector / condensed_encoder"
+                        " / projector_c it contains. Must be paired with the same config "
+                        "used to produce it (--llm-frozen False + --lora-rank/--lora-alpha/"
+                        "--lora-target-modules for the LoRA part, --dual-graph-mode/--gnn-* "
+                        "dims for the graph part), or load_state_dict will silently attach "
+                        "nothing (mismatched key names/shapes).")
     p.add_argument("--eval-only", dest="eval_only", action="store_true",
                    help="Skip the training rounds and server aggregation entirely -- just "
                         "run the (optionally --load-checkpoint-restored) model once against "
