@@ -258,14 +258,22 @@ class FedTrainer:
         self._print_metrics_table(round_metrics)
 
     def _run_eval_only(self) -> None:
-        """--eval-only: no training rounds, no server aggregation -- just run
-        the already-loaded (optionally checkpoint-restored) shared_model
-        against --dataset's test split once. Intended for evaluating a LoRA
-        checkpoint trained on a separate <dataset>_train pseudo-dataset
-        against this (untouched) dataset's full question set -- pair with
-        --qa-test-only at preprocess time so test_idx covers all of it, and
-        --max-eval-samples set above the question count so nothing gets
-        capped.
+        """--eval-only: no training rounds, no FedAvg of trained weights --
+        just run the already-loaded (optionally checkpoint-restored)
+        shared_model against --dataset's test split once. Intended for
+        evaluating a checkpoint trained on a separate <dataset>_train
+        pseudo-dataset against this (untouched) dataset's full question set
+        -- pair with --qa-test-only at preprocess time so test_idx covers
+        all of it, and --max-eval-samples set above the question count so
+        nothing gets capped.
+
+        Still runs the round-0-equivalent Stage B/C bootstrap (client
+        condense + server synthetic-graph construction) first: Θ_syn is
+        built from THIS dataset's own corpus, not the training run's --
+        skipping it would leave condensed_encoder/projector_c (loaded from
+        the checkpoint) operating on an empty/never-built synthetic graph,
+        corrupting the dual-graph prompt for any --dual-graph-mode that uses
+        it (the default, "both").
         """
         if self.shared_model is None:
             raise RuntimeError(
@@ -277,6 +285,18 @@ class FedTrainer:
                 "--eval-only: no test samples loaded. Build the QA cache with "
                 "--qa-test-only (or check --qa-data-root points at the right cache)."
             )
+        print("[eval-only] running Stage B/C bootstrap for this dataset's own "
+              "synthetic graph before evaluating...", flush=True)
+        self.message_pool["round"] = 0
+        sampled = list(range(self.args.num_clients))
+        self.message_pool["sampled_clients"] = sampled
+        self.server.send_message()
+        for cid in sampled:
+            self.clients[cid].receive_message()
+            self.clients[cid].execute()
+            self.clients[cid].send_message()
+        self.server.execute()
+
         print(f"[eval-only] evaluating on {len(self._test_samples)} test samples "
               f"(--max-eval-samples={getattr(self.args, 'max_eval_samples', 200)} "
               "-- raise it if this is less than your test set size)", flush=True)
