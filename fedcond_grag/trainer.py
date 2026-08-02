@@ -25,7 +25,7 @@ import torch
 
 from fedcond_grag.client.client import FedCondQAClient
 from fedcond_grag.constants import ENCODER_DIM
-from fedcond_grag.server.lora_aggregate import has_lora, lora_state_dict
+from fedcond_grag.server.lora_aggregate import has_lora
 from fedcond_grag.server.server import FedCondQAServer
 from fedcond_grag.utils.evaluate import exact_match, normalize, token_f1
 
@@ -64,6 +64,15 @@ class FedTrainer:
         load_ckpt = getattr(args, "load_checkpoint", None)
         if load_ckpt:
             self._load_checkpoint(load_ckpt)
+            # client.set_shared_model() already ran (inside _init_stage_d(),
+            # above) against the pre-checkpoint model and snapshotted its
+            # weights into each client's own local cache. Without re-running
+            # it here, every client would upload/train from those stale
+            # pre-checkpoint weights at round 0/1, silently discarding the
+            # checkpoint before a single real gradient step.
+            if self.shared_model is not None:
+                for client in self.clients:
+                    client.set_shared_model(self.shared_model)
 
         self._metrics_path = Path(getattr(args, "metrics_path", "/tmp/fl_metrics.jsonl"))
         self._metrics_path.write_text("")   # reset on new run
@@ -201,6 +210,15 @@ class FedTrainer:
             agg_time = time.perf_counter() - t0
             print(f"    server agg done in {agg_time:.2f}s", flush=True)
 
+            # self.shared_model is one object every client's local_train()
+            # mutates in place with its own local weights -- after the
+            # client loop it reflects whichever client trained last, not
+            # the FedAvg'd aggregate server.execute() just computed. Sync it
+            # before eval/_save_checkpoint so both look at the real global
+            # model.
+            if self.shared_model is not None:
+                self._sync_shared_model_from_server()
+
             train_acc = val_acc = test_acc = None
             val_metrics = test_metrics = None
             eval_time = None
@@ -322,17 +340,46 @@ class FedTrainer:
     # != none) regardless of whether the LLM itself is frozen.
     _GRAPH_WEIGHT_KEYS = ("graph_encoder", "projector", "condensed_encoder", "projector_c")
 
+    def _sync_shared_model_from_server(self) -> None:
+        """Load the server's just-FedAvg'd graph weights (+ LoRA, if any)
+        into self.shared_model.
+
+        self.shared_model is one object shared by reference; each client's
+        local_train() loads its OWN local weights into it and trains in
+        place, so after the per-client loop it reflects whichever client
+        happened to run last, not the aggregate server.execute() just
+        computed into self.server.global_model_state/global_lora. Call this
+        right after server.execute(), before eval or _save_checkpoint.
+        """
+        state = getattr(self.server, "global_model_state", None) or {}
+        for key in self._GRAPH_WEIGHT_KEYS:
+            if key in state:
+                getattr(self.shared_model, key).load_state_dict(state[key])
+        global_lora = getattr(self.server, "global_lora", None)
+        if global_lora:
+            self.shared_model.model.load_state_dict(global_lora, strict=False)
+
     def _save_checkpoint(self, round_id: int, val_metrics: dict, test_metrics: dict | None) -> None:
         """Persist whatever this run actually trained: the LoRA adapter (LLM
         fine-tune, --llm-frozen False) and/or the FedAvg'd graph_encoder/
         projector/condensed_encoder/projector_c (--llm-frozen True is the
         common case -- those are the only thing training then).
+
+        Reads the LoRA from self.server.global_lora (the FedAvg'd
+        aggregate), not lora_state_dict(model.model) directly -- the latter
+        would be one client's private, un-aggregated local delta (same
+        stale-shared_model issue _sync_shared_model_from_server fixes for
+        eval; by the time this runs, though, the call above already
+        synced self.shared_model.model to global_lora, so either read is
+        equivalent here -- go through self.server.global_lora directly to
+        stay correct even if that sync call is ever skipped).
         """
         model = self.shared_model
         graph_state = {
             key: state for key, state in (getattr(self.server, "global_model_state", None) or {}).items()
             if key in self._GRAPH_WEIGHT_KEYS
         }
+        global_lora = getattr(self.server, "global_lora", None)
         model_has_lora = has_lora(model.model)
         if not model_has_lora and not graph_state:
             print("    [checkpoint] skipped -- no LoRA adapter and no trained graph "
@@ -345,7 +392,7 @@ class FedTrainer:
             "test_metrics": dict(test_metrics) if test_metrics else None,
             "dataset": getattr(self.args, "dataset", None),
             "lora_agg_method": getattr(self.args, "lora_agg_method", None),
-            **({"lora": lora_state_dict(model.model)} if model_has_lora else {}),
+            **({"lora": global_lora} if global_lora else {}),
             **graph_state,
         }
 
