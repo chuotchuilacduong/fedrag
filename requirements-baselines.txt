@@ -62,3 +62,11 @@ tiktoken
 # semantic/episodic memory clustering (need_cluster=True, ComoRAG's actual
 # novel contribution).
 umap-learn
+
+# --- baselines/dgrag ---
+# DGRAG uses Leiden community detection for graph partitioning (§3.2).
+# python-igraph (already in requirements.txt, pinned 1.0.0) has a built-in
+# community_leiden method used as the default. The optional leidenalg package
+# provides a more featureful implementation but is not strictly required.
+# Uncomment if you want leidenalg's extra features:
+# leidenalg
