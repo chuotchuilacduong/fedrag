@@ -116,7 +116,12 @@ class GraphLLM(torch.nn.Module):
                 param.requires_grad = False
         else:
             print("Training LLAMA with LORA!")
-            model = prepare_model_for_kbit_training(model)
+            if bool(getattr(args, "eval_only", False)):
+                # kbit prep upcasts embeddings/lm_head to fp32 (~2-4GB VRAM on
+                # Qwen's 152k vocab) and is only needed for gradient stability
+                print("eval-only: skipping prepare_model_for_kbit_training")
+            else:
+                model = prepare_model_for_kbit_training(model)
             lora_r: int = 8
             lora_alpha: int = 16
             lora_dropout: float = 0.05
@@ -180,7 +185,12 @@ class GraphLLM(torch.nn.Module):
         # parameters or rebuild bos/pad embeddings on every forward pass.
         self._device_cache = _true_device
         with torch.no_grad():
-            bos_ids = self.tokenizer(self.bos_text, add_special_tokens=False, return_tensors='pt').input_ids[0]
+            if self.bos_text:
+                bos_ids = self.tokenizer(self.bos_text, add_special_tokens=False, return_tensors='pt').input_ids[0].long()
+            else:
+                # Empty bos (base-model plain template): tokenizer returns an
+                # empty FLOAT tensor for "", which crashes nn.Embedding.
+                bos_ids = torch.empty(0, dtype=torch.long)
             self._bos_embeds_cached = self.word_embedding(bos_ids.to(self._device_cache)).detach()
             pad_id = torch.tensor(self.tokenizer.pad_token_id, device=self._device_cache)
             self._pad_embed_cached = self.word_embedding(pad_id).detach().unsqueeze(0)

@@ -20,9 +20,7 @@ from unittest.mock import MagicMock, patch
 import torch
 from torch_geometric.data import Data
 
-from fedcond_grag.dataloader.corpus_index import CorpusIndex
-from fedcond_grag.dataloader.federated_partition import federated_partition, partition_stats
-from fedcond_grag.dataloader.hotpot_loader import HotpotCorpus, load_hotpot
+from fedcond_grag.dataloader.data_preprocess import CorpusIndex, federated_partition, partition_stats, HotpotCorpus, load_hotpot
 from fedcond_grag.client.stage_a_trigraph.graph_store import load_trigraph, save_trigraph
 from fedcond_grag.client.stage_a_trigraph.trigraph_builder import (
     ENTITY,

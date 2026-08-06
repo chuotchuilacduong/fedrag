@@ -3,6 +3,7 @@ from .utils import compute_mdhash_id
 import numpy as np
 import pandas as pd
 import os
+import gc
 
 class EmbeddingStore:
     def __init__(self, embedding_model, db_filename, batch_size, namespace):
@@ -25,7 +26,11 @@ class EmbeddingStore:
             df = pd.read_parquet(self.db_filename)
             self.hash_ids = df["hash_id"].values.tolist()
             self.texts = df["text"].values.tolist()
-            self.embeddings = df["embedding"].values.tolist()
+            # Stack into a single 2D float32 array to avoid per-row Python object overhead
+            raw = df["embedding"].values
+            self.embeddings = np.stack(raw).astype(np.float32)
+            del df, raw
+            gc.collect()
             
             self.hash_id_to_idx = {h: idx for idx, h in enumerate(self.hash_ids)}
             self.hash_id_to_text = {h: t for h, t in zip(self.hash_ids, self.texts)}
@@ -47,21 +52,31 @@ class EmbeddingStore:
         self._upsert(missing_ids, texts_to_encode, all_embeddings)
 
     def _upsert(self, hash_ids, texts, embeddings):
+        if not hash_ids:
+            return
+        new_embs = np.array(embeddings, dtype=np.float32)
+        if isinstance(self.embeddings, np.ndarray) and self.embeddings.ndim == 2:
+            self.embeddings = np.vstack([self.embeddings, new_embs])
+        elif isinstance(self.embeddings, np.ndarray) and self.embeddings.ndim < 2:
+            self.embeddings = new_embs
+        else:
+            self.embeddings = new_embs
         self.hash_ids.extend(hash_ids)
         self.texts.extend(texts)
-        self.embeddings.extend(embeddings)
-        
+
         self.hash_id_to_idx = {h: idx for idx, h in enumerate(self.hash_ids)}
         self.hash_id_to_text = {h: t for h, t in zip(self.hash_ids, self.texts)}
         self.text_to_hash_id = {t: h for t, h in zip(self.texts, self.hash_ids)}
-        
+
         self._save_data()
 
     def _save_data(self):
+        # embeddings is a 2D numpy array; parquet expects a list/object column of 1D arrays
+        emb_list = list(self.embeddings) if isinstance(self.embeddings, np.ndarray) else self.embeddings
         data_to_save = pd.DataFrame({
             "hash_id": self.hash_ids,
             "text": self.texts,
-            "embedding": self.embeddings
+            "embedding": emb_list
         })
         os.makedirs(os.path.dirname(self.db_filename), exist_ok=True)
         data_to_save.to_parquet(self.db_filename, index=False)
@@ -76,5 +91,4 @@ class EmbeddingStore:
         if not hash_ids:
             return np.array([])
         indices = np.array([self.hash_id_to_idx[h] for h in hash_ids], dtype=np.intp)
-        embeddings = np.array(self.embeddings)[indices]
-        return embeddings
+        return self.embeddings[indices]

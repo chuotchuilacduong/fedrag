@@ -25,7 +25,13 @@ import torch
 
 from fedcond_grag.client.client import FedCondQAClient
 from fedcond_grag.server.server import FedCondQAServer
-from fedcond_grag.utils.evaluate import exact_match, normalize, token_f1
+from fedcond_grag.utils.evaluate import (
+    exact_match,
+    norm_passage_title,
+    normalize,
+    retrieval_recall_at_k,
+    token_f1,
+)
 
 
 class FedTrainer:
@@ -55,7 +61,7 @@ class FedTrainer:
         self._train_eval_samples: list = []
         self._val_samples: list = []
         self._test_samples: list = []
-        if int(getattr(args, "num_rounds", 1)) > 1:
+        if int(getattr(args, "num_rounds", 1)) > 1 or bool(getattr(args, "eval_only", False)):
             self._init_stage_d()
 
         self._metrics_path = Path(getattr(args, "metrics_path", "/tmp/fl_metrics.jsonl"))
@@ -108,6 +114,10 @@ class FedTrainer:
     # ------------------------------------------------------------------
 
     def train(self) -> None:
+        if bool(getattr(self.args, "eval_only", False)):
+            self._run_eval_only()
+            return
+
         num_rounds = int(getattr(self.args, "num_rounds", 1))
         client_frac = float(getattr(self.args, "client_frac", 1.0))
         round_metrics: list[dict] = []
@@ -175,14 +185,27 @@ class FedTrainer:
                     val_metrics = self._eval_split_acc(self._val_samples)
                     val_acc = val_metrics["hit"]
                     print(f"    val   : hit {val_metrics['hit']:.1f}% | "
-                          f"EM {val_metrics['em']:.1f}% | F1 {val_metrics['f1']:.1f}", flush=True)
+                          f"EM {val_metrics['em']:.1f}% | F1 {val_metrics['f1']:.1f} | "
+                          f"R@1 {val_metrics['r@1']:.1f}% | R@2 {val_metrics['r@2']:.1f}% | "
+                          f"R@5 {val_metrics['r@5']:.1f}%", flush=True)
                 if self._test_samples:
                     test_metrics = self._eval_split_acc(self._test_samples)
                     test_acc = test_metrics["hit"]
                     print(f"    test  : hit {test_metrics['hit']:.1f}% | "
-                          f"EM {test_metrics['em']:.1f}% | F1 {test_metrics['f1']:.1f}", flush=True)
+                          f"EM {test_metrics['em']:.1f}% | F1 {test_metrics['f1']:.1f} | "
+                          f"R@1 {test_metrics['r@1']:.1f}% | R@2 {test_metrics['r@2']:.1f}% | "
+                          f"R@5 {test_metrics['r@5']:.1f}%", flush=True)
                 eval_time = time.perf_counter() - t_eval
                 print(f"    eval done in {eval_time:.1f}s", flush=True)
+
+                # Keep the best-val-round weights in RAM (the final round is
+                # often not the best one); written to disk once at the end.
+                if val_metrics is not None and val_metrics["hit"] >= getattr(self, "_best_val_hit", -1.0):
+                    self._best_val_hit = val_metrics["hit"]
+                    self._best_val_round = round_id
+                    self._best_val_state = self._collect_trainable_ckpt()
+                    print(f"    [checkpoint] best-val snapshot updated (hit {val_metrics['hit']:.1f}%, round {round_id})",
+                          flush=True)
 
             round_time = time.perf_counter() - t_round_start
             avg_loss = (
@@ -203,22 +226,141 @@ class FedTrainer:
                 "val_f1": val_metrics["f1"] if val_metrics else None,
                 "test_em": test_metrics["em"] if test_metrics else None,
                 "test_f1": test_metrics["f1"] if test_metrics else None,
+                **{f"val_r@{k}": val_metrics[f"r@{k}"] if val_metrics else None
+                   for k in (1, 2, 5)},
+                **{f"test_r@{k}": test_metrics[f"r@{k}"] if test_metrics else None
+                   for k in (1, 2, 5)},
             }
             round_metrics.append(metrics)
             self._log_metrics(metrics, global_step=global_step)
 
         self._print_metrics_table(round_metrics)
 
+        try:
+            self._save_final_checkpoint()
+            if getattr(self, "_best_val_state", None) is not None:
+                self._save_final_checkpoint(suffix="-best", upload=False,
+                                            ckpt=self._best_val_state)
+                print(f"[checkpoint] best-val round was {self._best_val_round} "
+                      f"(hit {self._best_val_hit:.1f}%)", flush=True)
+        except Exception as exc:  # never let checkpointing kill a finished run
+            print(f"[checkpoint] save failed: {exc}", flush=True)
+
+    def _collect_trainable_ckpt(self) -> dict | None:
+        """Snapshot the FedAvg-exchanged parameter groups to CPU tensors."""
+        model = self.shared_model
+        if model is None:
+            return None
+        prefixes = ("graph_encoder", "projector", "condensed_encoder", "projector_c")
+        ckpt = {"module_weights": {}, "lora": {}, "args": dict(vars(self.args))}
+        for source in (model.named_parameters(), model.named_buffers()):
+            for n, t in source:
+                if any(n.startswith(k) for k in prefixes):
+                    ckpt["module_weights"][n] = t.detach().cpu().clone()
+                elif "lora_" in n:
+                    ckpt["lora"][n] = t.detach().cpu().clone()
+        return ckpt
+
+    def _save_final_checkpoint(self, suffix: str = "", upload: bool = True,
+                               ckpt: dict | None = None) -> None:
+        """Save trainable weights (graph modules + LoRA) and upload to WandB.
+
+        The checkpoint holds exactly the FedAvg-exchanged parameter groups, so
+        an eval-only run on another dataset can load it with strict=False.
+        Download later with:  wandb artifact get <entity>/<project>/model-<run>:latest
+
+        `suffix` names checkpoint variants (e.g. "-best" for the best-val-round
+        snapshot); pass `ckpt` to save an in-memory snapshot instead of the
+        current model state. WandB upload is reserved for the final checkpoint.
+        """
+        model = self.shared_model
+        if model is None:
+            return
+        prefixes = ("graph_encoder", "projector", "condensed_encoder", "projector_c")
+        if ckpt is None:
+            ckpt = {"module_weights": {}, "lora": {}, "args": dict(vars(self.args))}
+            for source in (model.named_parameters(), model.named_buffers()):
+                for n, t in source:
+                    if any(n.startswith(k) for k in prefixes):
+                        ckpt["module_weights"][n] = t.detach().cpu()
+                    elif "lora_" in n:
+                        ckpt["lora"][n] = t.detach().cpu()
+
+        run_name = None
+        if self._wandb is not None:
+            run_name = getattr(self._wandb, "name", None)
+        tag = (run_name or f"{self.args.dataset}-{getattr(self.args, 'dual_graph_mode', 'run')}") + suffix
+        out_dir = Path("checkpoints")
+        out_dir.mkdir(exist_ok=True)
+        path = out_dir / f"{tag}.pt"
+        torch.save(ckpt, path)
+        n_lora = len(ckpt["lora"])
+        n_mod = len(ckpt["module_weights"])
+        print(f"[checkpoint] saved {path} ({n_mod} module tensors, {n_lora} LoRA tensors)",
+              flush=True)
+
+        if upload and self._wandb is not None:
+            import wandb
+            artifact = wandb.Artifact(f"model-{tag}", type="model",
+                                      metadata={"dataset": self.args.dataset,
+                                                "dual_graph_mode": getattr(self.args, "dual_graph_mode", None),
+                                                "llm_frozen": getattr(self.args, "llm_frozen", None)})
+            artifact.add_file(str(path))
+            self._wandb.log_artifact(artifact)
+            print(f"[checkpoint] uploaded WandB artifact model-{tag}", flush=True)
+
     # ------------------------------------------------------------------
     # Evaluation
     # ------------------------------------------------------------------
 
+    def _run_eval_only(self) -> None:
+        """Load a saved checkpoint and evaluate without any local training.
+
+        Runs one artifact-exchange round so clients/server hold the same state
+        as at the start of a normal round, then evaluates val + test.
+        """
+        self.message_pool["round"] = 0
+        self.message_pool["sampled_clients"] = list(range(self.args.num_clients))
+        self.server.send_message()
+        for client in self.clients:
+            client.receive_message()
+            client.execute()
+            client.send_message()
+        self.server.execute()
+
+        if self.shared_model is None:
+            print("[eval-only] Stage D model unavailable — nothing to evaluate")
+            return
+
+        ckpt_path = str(getattr(self.args, "load_checkpoint", "") or "")
+        if ckpt_path:
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            state = {}
+            state.update(ckpt.get("module_weights", {}))
+            state.update(ckpt.get("lora", {}))
+            missing, unexpected = self.shared_model.load_state_dict(state, strict=False)
+            print(f"[eval-only] loaded {len(state)} tensors from {ckpt_path} "
+                  f"(unexpected {len(unexpected)})", flush=True)
+
+        for name, samples in (("val", self._val_samples), ("test", self._test_samples)):
+            if not samples:
+                continue
+            t0 = time.perf_counter()
+            m = self._eval_split_acc(samples)
+            print(f"    {name:5s} : hit {m['hit']:.1f}% | EM {m['em']:.1f}% | "
+                  f"F1 {m['f1']:.1f} | R@1 {m['r@1']:.1f}% | R@2 {m['r@2']:.1f}% | "
+                  f"R@5 {m['r@5']:.1f}% | {time.perf_counter() - t0:.0f}s", flush=True)
+            if self._wandb is not None:
+                self._wandb.log({f"eval_only/{name}_{k}": v for k, v in m.items()})
+
     def _eval_split_acc(self, samples: list) -> dict:
         """Distribute samples across clients, run inference with on-the-fly retrieval.
 
-        Returns {"hit", "em", "f1"} in percent — hit is the legacy normalized
-        substring containment; em/f1 are SQuAD/MuSiQue-style exact match and
-        token-level F1.
+        Returns {"hit", "em", "f1", "r@1", "r@2", "r@5"} in percent — hit is
+        the legacy normalized substring containment; em/f1 are SQuAD/MuSiQue-style
+        exact match and token-level F1; r@k is the passage recall of the PPR
+        retrieval that feeds the LLM (gold evidence passages found in the
+        top-k retrieved passages).
         """
         from fedcond_grag.client.stage_d_retrieve.global_graph_retriever import GlobalGraphRetriever
         from fedcond_grag.utils.collate import collate_fn
@@ -230,13 +372,33 @@ class FedTrainer:
         hits = 0
         em_total = 0.0
         f1_total = 0.0
+        recall_ks = (1, 2, 5)
+        recall_totals = {k: 0.0 for k in recall_ks}
+        recall_n = 0
         self.shared_model.eval()
 
+        broadcast = bool(getattr(self.args, "eval_broadcast", False))
         with torch.no_grad():
             for cid, client in enumerate(self.clients):
-                shard = [s for i, s in enumerate(samples) if i % n_clients == cid]
+                if broadcast:
+                    shard = list(samples)
+                else:
+                    # Shard by the sample's true dataset index (idx % C), matching
+                    # both training ownership and the per-client PPR maps. Position
+                    # in the list only coincides with this when the split block
+                    # starts at a multiple of C (true for 2wiki, false for
+                    # musique/hotpotqa whose split boundaries aren't %3-aligned).
+                    shard = [s for i, s in enumerate(samples)
+                             if int(s.get("idx", i)) % n_clients == cid]
                 if not shard:
                     continue
+                c_hits = c_em = c_f1 = 0.0
+                for s in shard:
+                    rec = self._sample_retrieval_recall(client, s, recall_ks)
+                    if rec:
+                        recall_n += 1
+                        for k in recall_ks:
+                            recall_totals[k] += rec[k]
                 shard = client._attach_evidence_graphs(shard)
                 syn_retriever = (
                     GlobalGraphRetriever(client.synthetic_graph, top_r=top_r)
@@ -250,17 +412,54 @@ class FedTrainer:
                     out = self.shared_model.inference(batch)
                     for pred, label in zip(out["pred"], out["label"]):
                         if normalize(label) in normalize(pred):
-                            hits += 1
+                            c_hits += 1
                         if exact_match(pred, label):
-                            em_total += 1.0
-                        f1_total += token_f1(pred, label)
+                            c_em += 1.0
+                        c_f1 += token_f1(pred, label)
+                hits += c_hits
+                em_total += c_em
+                f1_total += c_f1
+                if broadcast:
+                    c_n = max(len(shard), 1)
+                    print(f"      [broadcast] client_{cid}: hit {100.0 * c_hits / c_n:.1f}% | "
+                          f"EM {100.0 * c_em / c_n:.1f}% | F1 {100.0 * c_f1 / c_n:.1f} "
+                          f"(n={len(shard)})", flush=True)
 
-        n = max(len(samples), 1)
-        return {
+        n = max(len(samples) * (n_clients if broadcast else 1), 1)
+        metrics = {
             "hit": 100.0 * hits / n,
             "em": 100.0 * em_total / n,
             "f1": 100.0 * f1_total / n,
         }
+        for k in recall_ks:
+            metrics[f"r@{k}"] = 100.0 * recall_totals[k] / max(recall_n, 1)
+        return metrics
+
+    @staticmethod
+    def _sample_retrieval_recall(client, sample: dict, ks=(1, 2, 5)) -> dict:
+        """Recall@k of the client's PPR passage retrieval for one sample.
+
+        Gold = titles of the sample's evidence passages (record
+        "retrieved_passages"); retrieved = rank-ordered PPR passage nodes from
+        ppr_node_map.pt. Slots that map to no local node count as misses.
+        Returns {} when recall cannot be computed (no map / no gold).
+        """
+        ppr_map = getattr(client, "_ppr_node_map", None)
+        idx = sample.get("idx")
+        if ppr_map is None or idx is None or idx >= ppr_map.shape[0]:
+            return {}
+        gold_titles = {
+            norm_passage_title(p) for p in sample.get("retrieved_passages", []) or []
+        }
+        node_text = getattr(client.tri_graph, "node_text", None)
+        if not gold_titles or not node_text:
+            return {}
+        N = len(node_text)
+        retrieved_titles = [
+            norm_passage_title(node_text[nid]) if 0 <= nid < N else None
+            for nid in ppr_map[idx].tolist()
+        ]
+        return retrieval_recall_at_k(gold_titles, retrieved_titles, ks)
 
     def _log_metrics(self, metrics: dict, global_step: int = 0) -> None:
         with self._metrics_path.open("a") as f:
@@ -282,7 +481,9 @@ class FedTrainer:
             log["round/val_acc"] = metrics["val_acc"]
         if metrics["test_acc"] is not None:
             log["round/test_acc"] = metrics["test_acc"]
-        for key in ("val_em", "val_f1", "test_em", "test_f1"):
+        for key in ("val_em", "val_f1", "test_em", "test_f1",
+                    "val_r@1", "val_r@2", "val_r@5",
+                    "test_r@1", "test_r@2", "test_r@5"):
             if metrics.get(key) is not None:
                 log[f"round/{key}"] = metrics[key]
         # Timing
@@ -328,8 +529,13 @@ class FedTrainer:
         from fedcond_grag.client.stage_d_retrieve.global_graph_retriever import GlobalGraphRetriever
         top_r = int(getattr(self.args, "retrieval_top_r", 16))
         n_show = min(10, len(self._test_samples))
-        mini = list(self._test_samples[:n_show])
         client = self.clients[0]
+        n_clients = len(self.clients)
+        # Only use samples that belong to client_0 in the FL split (idx % n_clients == 0)
+        # to avoid RuntimeError from missing PPR anchors for other clients' samples.
+        mini = [s for s in self._test_samples if s.get("idx", -1) % n_clients == 0][:n_show]
+        if not mini:
+            return
         mini = client._attach_evidence_graphs(mini)
         if client.synthetic_graph is not None:
             r = GlobalGraphRetriever(client.synthetic_graph, top_r=top_r)
@@ -338,6 +544,7 @@ class FedTrainer:
         self.shared_model.eval()
         with torch.no_grad():
             out = self.shared_model.inference(batch)
+        n_show = len(mini)
         print("\nSAMPLE PREDICTIONS (test, first 10)")
         print("-" * W)
         for i in range(n_show):
@@ -443,11 +650,13 @@ class FedTrainer:
             print(f"[FedTrainer] Stage D disabled: failed to load DualGraphLLM — {exc}")
             return
 
+        # LoRA adapters (created when llm_frozen == "False") must stay trainable;
+        # everything else in the LLM stays frozen.
         for name, param in model.named_parameters():
             param.requires_grad = any(
                 name.startswith(k) for k in
                 ("graph_encoder", "projector", "condensed_encoder", "projector_c")
-            )
+            ) or "lora_" in name
 
         if not hasattr(model, "hf_device_map"):
             model.to(self.device)

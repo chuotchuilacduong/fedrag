@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import random
+import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,6 +22,10 @@ from fedcond_grag.utils.collate import collate_fn
 
 if TYPE_CHECKING:
     from fedcond_grag.model.dual_graph_llm import DualGraphLLM
+
+# Trigraph passage node_text carries a "<node_id>:" prefix ("12:Title: body")
+# that must not leak into the LLM prompt.
+_NODE_PREFIX_RE = re.compile(r"^\d+:")
 
 
 class FedCondQAClient:
@@ -71,11 +76,21 @@ class FedCondQAClient:
         if isinstance(dataset, (list, tuple)):  # GFL-style configs pass a list
             dataset = dataset[0] if dataset else ""
         path = str(Path(data_root) / str(dataset))
-        map_path = Path(path) / f"client_{self.client_id}" / "ppr_node_map.pt"
-        if map_path.exists():
-            m = torch.load(map_path, map_location="cpu", weights_only=True)
-            print(f"    [client_{self.client_id}] Loaded ppr_node_map.pt {tuple(m.shape)}")
-            return m
+        client_dir = Path(path) / f"client_{self.client_id}"
+        # Broadcast eval needs anchors for every question, not just owned ones —
+        # prefer the _all map (built with preprocess_fedcond_qa.py --all-questions).
+        candidates = ["ppr_node_map.pt"]
+        if bool(getattr(self.args, "eval_broadcast", False)):
+            candidates.insert(0, "ppr_node_map_all.pt")
+        explicit = str(getattr(self.args, "ppr_map_name", "") or "")
+        if explicit:
+            candidates.insert(0, explicit)
+        for name in candidates:
+            map_path = client_dir / name
+            if map_path.exists():
+                m = torch.load(map_path, map_location="cpu", weights_only=True)
+                print(f"    [client_{self.client_id}] Loaded {name} {tuple(m.shape)}")
+                return m
         return None
 
     # ------------------------------------------------------------------
@@ -83,8 +98,10 @@ class FedCondQAClient:
     # ------------------------------------------------------------------
 
     def set_local_qa_data(self, samples: list) -> None:
-        # Pre-attach evidence graphs once — avoids repeated retrieval across epochs.
-        self.local_qa_samples = self._attach_evidence_graphs(samples)
+        # Store raw samples only — local_train attaches evidence + condensed
+        # graphs per mini-batch, so pre-attaching here would duplicate that
+        # work for the whole pool at startup (minutes + GBs for full data).
+        self.local_qa_samples = list(samples)
         self._num_local_samples = len(samples)
 
     def set_full_train_pool(self, samples: list, max_per_round: int | None = None) -> None:
@@ -112,9 +129,15 @@ class FedCondQAClient:
         self.local_qa_samples = subset  # raw samples; no graph attached yet
         self._num_local_samples = len(self.local_qa_samples)
 
+    @staticmethod
+    def _lora_state(model: "DualGraphLLM") -> dict:
+        """Snapshot LoRA adapter params (empty dict when llm_frozen == 'True')."""
+        return {n: p.detach().clone() for n, p in model.named_parameters() if "lora_" in n}
+
     def set_shared_model(self, model: "DualGraphLLM") -> None:
         """Store reference to the shared LLM and snapshot initial weights."""
         self.shared_model = model
+        lora_sd = self._lora_state(model)
         self._model_weights = {
             "graph_encoder": copy.deepcopy(model.graph_encoder.state_dict()),
             "projector": copy.deepcopy(model.projector.state_dict()),
@@ -122,6 +145,7 @@ class FedCondQAClient:
                if model.condensed_encoder is not None else {}),
             **({"projector_c": copy.deepcopy(model.projector_c.state_dict())}
                if model.projector_c is not None else {}),
+            **({"lora": lora_sd} if lora_sd else {}),
         }
 
     # ------------------------------------------------------------------
@@ -137,8 +161,8 @@ class FedCondQAClient:
             self.synthetic_graph = synthetic_graph
 
         model_weights = msg.get("model_weights")
-        if model_weights and self._model_weights is not None:
-            for key in ("graph_encoder", "projector", "condensed_encoder", "projector_c"):
+        if model_weights and self._model_weights is not None and not getattr(self.args, "no_fedavg", False):
+            for key in ("graph_encoder", "projector", "condensed_encoder", "projector_c", "lora"):
                 if key in model_weights:
                     self._model_weights[key] = {
                         k: v.clone() for k, v in model_weights[key].items()
@@ -193,6 +217,7 @@ class FedCondQAClient:
                if self.shared_model.condensed_encoder is not None else [])
             + (list(self.shared_model.projector_c.parameters())
                if self.shared_model.projector_c is not None else [])
+            + [p for n, p in self.shared_model.named_parameters() if "lora_" in n]
         )
         if self._optimizer is None:
             self._optimizer = torch.optim.AdamW(
@@ -261,6 +286,7 @@ class FedCondQAClient:
                 # gives memory back to the driver and re-allocates next step.
 
         # Snapshot updated weights — skip components that don't exist (shared mode)
+        lora_sd = self._lora_state(self.shared_model)
         self._model_weights = {
             "graph_encoder": copy.deepcopy(self.shared_model.graph_encoder.state_dict()),
             "projector": copy.deepcopy(self.shared_model.projector.state_dict()),
@@ -268,6 +294,7 @@ class FedCondQAClient:
                if self.shared_model.condensed_encoder is not None else {}),
             **({"projector_c": copy.deepcopy(self.shared_model.projector_c.state_dict())}
                if self.shared_model.projector_c is not None else {}),
+            **({"lora": lora_sd} if lora_sd else {}),
         }
         return total_loss / max(total_steps, 1), total_steps
 
@@ -300,16 +327,22 @@ class FedCondQAClient:
             self.shared_model.condensed_encoder.load_state_dict(self._model_weights["condensed_encoder"])
         if self.shared_model.projector_c is not None and "projector_c" in self._model_weights:
             self.shared_model.projector_c.load_state_dict(self._model_weights["projector_c"])
+        if "lora" in self._model_weights:
+            # LoRA keys are a strict subset of the full state dict — strict=False
+            # leaves every non-LoRA weight untouched.
+            self.shared_model.load_state_dict(self._model_weights["lora"], strict=False)
 
     def _attach_evidence_graphs(self, samples: list) -> list:
         """Build per-sample evidence subgraphs from per-query PPR anchor nodes.
 
-        anchor_passage_nodes (from passage_node_map.pt) are the PPR-selected
+        anchor_passage_nodes (from ppr_node_map.pt) are the PPR-selected
         passage trigraph nodes for this query. We filter to the local client's
         nodes, use them as 1-hop expansion seeds for the evidence graph, and
-        cosine-rerank them to produce the LLM text desc.
+        (with desc_source="ppr", the default) use their rank-ordered passage
+        texts as the LLM text desc — so the LLM reads exactly what the
+        federated retrieval returned.
 
-        Raises RuntimeError if passage_node_map.pt was not generated first.
+        Raises RuntimeError if ppr_node_map.pt was not generated first.
         """
         import torch.nn.functional as F
         from torch_geometric.data import Data as _Data
@@ -332,8 +365,28 @@ class FedCondQAClient:
         x_cpu = self.tri_graph.x.cpu()
         nt_cpu = self.tri_graph.node_type.cpu()
         node_text = getattr(self.tri_graph, "node_text", None)
+        has_node_text = (
+            node_text is not None
+            and isinstance(node_text, (list, tuple))
+            and len(node_text) == N
+        )
         adj = self._local_adj
-        top_k_desc = max(1, int(getattr(self.args, "top_r_anchor", None) or 5))
+        desc_source = str(getattr(self.args, "desc_source", "ppr"))
+        use_ppr_desc = desc_source == "ppr"
+
+        if desc_source == "file" and getattr(self, "_desc_file_map", None) is None:
+            import json as _json
+            desc_path = str(getattr(self.args, "desc_file", "") or "")
+            if not desc_path:
+                raise RuntimeError("--desc-source file requires --desc-file")
+            desc_map: dict[str, str] = {}
+            with open(desc_path, encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        row = _json.loads(line)
+                        desc_map[str(row["id"])] = str(row.get("desc", ""))
+            self._desc_file_map = desc_map
+            print(f"    [client_{self.client_id}] loaded {len(desc_map)} descs from {desc_path}")
 
         if self._ppr_node_map is None:
             raise RuntimeError(
@@ -352,7 +405,9 @@ class FedCondQAClient:
                 )
             row = self._ppr_node_map[idx]                          # [top_k]
             local = [int(n) for n in row.tolist() if n >= 0 and n < N]
-            if not local:
+            if not local and not bool(getattr(self.args, "eval_broadcast", False)):
+                # Broadcast eval tolerates missing anchors (question may have no
+                # entity match on this shard) — placeholder graph, empty desc.
                 raise RuntimeError(
                     f"[client_{self.client_id}] No PPR anchor nodes for sample "
                     f"idx={idx} ('{s.get('id')}'). "
@@ -364,7 +419,9 @@ class FedCondQAClient:
         out = []
         for s, local_anchors in zip(samples, per_sample_local_anchors):
             s = dict(s)
-            seed_set = set(local_anchors)
+            # Anchor-less samples (broadcast eval) get a placeholder 1-node graph;
+            # the empty anchor list also yields an empty ppr desc below.
+            seed_set = set(local_anchors) or {0}
 
             # 1-hop expansion
             kept_set = set(seed_set)
@@ -393,17 +450,34 @@ class FedCondQAClient:
                 edge_weight=sub_ew,
                 node_type=nt_cpu[kept_t],
             )
-            if node_text is not None and isinstance(node_text, (list, tuple)) and len(node_text) == N:
+            if has_node_text:
                 graph.node_text = [node_text[i] for i in kept_list]
             s["graph"] = graph
             s["evidence_graph"] = graph
 
-            # NOTE: desc is intentionally NOT overwritten with PPR-ranked passage texts.
-            # The evidence graph (built above from PPR anchor nodes) already carries
-            # the federated local knowledge as GNN soft-prompt tokens. Replacing desc
-            # with PPR passages would substitute gold MuSiQue evidence (which contains
-            # the answer) with trigraph passages that may belong to the wrong client
-            # shard and therefore contain irrelevant content for a given query.
+            # desc = rank-ordered text of the PPR-retrieved passage nodes, so the
+            # LLM text input is exactly the federated retrieval result (this is
+            # what the R@k metrics measure). desc_source="gold" keeps the
+            # pre-built dataset desc (gold evidence) instead.
+            if desc_source == "none":
+                s["desc"] = ""
+            elif desc_source == "file":
+                sid = str(s.get("id"))
+                if sid not in self._desc_file_map:
+                    raise RuntimeError(
+                        f"[client_{self.client_id}] --desc-file has no desc for "
+                        f"question id '{sid}' — rebuild the desc file."
+                    )
+                s["desc"] = self._desc_file_map[sid]
+            elif use_ppr_desc and has_node_text:
+                seen_texts: set[str] = set()
+                passages: list[str] = []
+                for nid in local_anchors:               # PPR rank order
+                    text = _NODE_PREFIX_RE.sub("", str(node_text[nid]), count=1).strip()
+                    if text and text not in seen_texts:
+                        seen_texts.add(text)
+                        passages.append(text)
+                s["desc"] = "\n\n".join(passages)
 
             out.append(s)
         return out

@@ -81,16 +81,15 @@ def test_collate_batches_evidence_and_condensed_graphs():
 
 
 def test_fedcond_qa_dataset_loads_cached_dual_graphs(tmp_path):
+    # FedCondQADataset returns raw QA records — graphs are attached on-the-fly
+    # by the client (not loaded from disk here). This test verifies the record
+    # fields and split index loading.
     root = tmp_path / "fedcond_qa"
-    (root / "cached_graphs").mkdir(parents=True)
-    (root / "cached_condensed_graphs").mkdir()
-    (root / "cached_desc").mkdir()
+    (root / "cached_desc").mkdir(parents=True)
     (root / "split").mkdir()
 
     with (root / "records.jsonl").open("w", encoding="utf-8") as handle:
         handle.write(json.dumps({"id": "q1", "question": "Who wrote the book?", "answer": "Ada", "retrieved_passages": ["p1"]}) + "\n")
-    torch.save(_graph(), root / "cached_graphs" / "q1.pt")
-    torch.save(_graph(1.0), root / "cached_condensed_graphs" / "q1.pt")
     (root / "cached_desc" / "q1.txt").write_text("Evidence graph text", encoding="utf-8")
     (root / "split" / "train_indices.txt").write_text("0\n", encoding="utf-8")
     (root / "split" / "val_indices.txt").write_text("0\n", encoding="utf-8")
@@ -102,7 +101,8 @@ def test_fedcond_qa_dataset_loads_cached_dual_graphs(tmp_path):
     assert item["id"] == "q1"
     assert item["question"].startswith("Question: Who wrote")
     assert item["label"] == "ada"
-    assert item["graph"].num_nodes == 3
-    assert item["evidence_graph"].num_nodes == 3
-    assert item["condensed_graph"].num_nodes == 3
+    assert item["desc"] == "Evidence graph text"
+    assert item["retrieved_passages"] == ["p1"]
+    assert "idx" in item
+    assert isinstance(item["idx"], int)
     assert dataset.get_idx_split() == {"train": [0], "val": [0], "test": [0]}

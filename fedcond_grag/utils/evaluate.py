@@ -4,6 +4,39 @@ from collections import Counter
 
 import pandas as pd
 
+_PASSAGE_PREFIX_RE = re.compile(r"^\d+:")
+
+
+def norm_passage_title(text: str) -> str:
+    """Normalise a passage text to its title for retrieval matching.
+
+    Same convention as scripts/preprocess_fedcond_qa.py: strip an optional
+    leading "<int>:" node prefix, then take everything before the first ":".
+    """
+    text = _PASSAGE_PREFIX_RE.sub("", str(text), count=1).strip()
+    head, _, _ = text.partition(":")
+    return head.strip().lower()
+
+
+def retrieval_recall_at_k(gold_titles, retrieved_titles, ks=(1, 2, 5)) -> dict:
+    """HippoRAG-style passage recall@k.
+
+    gold_titles: iterable of normalized gold passage titles (deduplicated here).
+    retrieved_titles: rank-ordered normalized titles (may contain None/"" for
+    passages that could not be mapped to a node — they count as misses).
+
+    Returns {k: recall} with recall = |gold ∩ top-k| / |gold|, or {} when
+    there are no gold titles.
+    """
+    gold = {t for t in gold_titles if t}
+    if not gold:
+        return {}
+    out = {}
+    for k in ks:
+        top = {t for t in retrieved_titles[:k] if t}
+        out[k] = len(gold & top) / len(gold)
+    return out
+
 
 def normalize(s: str) -> str:
     """Lower text and remove punctuation, articles and extra whitespace."""

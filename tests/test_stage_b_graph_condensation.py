@@ -2,16 +2,17 @@ import torch
 from torch_geometric.data import Data
 
 from fedcond_grag.client.stage_b_condense import (
+    AnchorSelection,
+    AnchorSelectorConfig,
     ClientCondensationConfig,
     ClientCondensor,
-    MotifSelectorConfig,
-    TextBank,
-    select_motif_core,
+    NodeTextBank,
+    select_anchor_nodes,
 )
 from fedcond_grag.client.stage_b_condense.chunk_selection import topk_softmax
 from fedcond_grag.client.stage_b_condense.graph_text_fusion import GraphTextFusion
 from fedcond_grag.client.stage_b_condense.neighbor_gating import hierarchical_text_condensation, score_and_select
-from fedcond_grag.client.stage_b_condense.text_bank import HashTextEncoder, build_text_bank, load_text_bank, save_text_bank
+from fedcond_grag.client.stage_b_condense.node_text_embedder import HashTextEncoder, build_text_bank, load_text_bank, save_text_bank
 from fedcond_grag.client.stage_b_condense.topology_reconstruction import (
     ENTITY,
     PASSAGE,
@@ -41,7 +42,7 @@ def _toy_text_bank(num_nodes=8, dim=16):
     torch.manual_seed(11)
     chunks = [torch.randn(3, dim) for _ in range(num_nodes)]
     node = torch.stack([c.mean(dim=0) for c in chunks], dim=0)
-    return TextBank(node_embeddings=node, chunk_embeddings=chunks, encoder_name="toy", dim=dim)
+    return NodeTextBank(node_embeddings=node, chunk_embeddings=chunks, encoder_name="toy", dim=dim)
 
 
 def test_topk_softmax_respects_budget():
@@ -89,9 +90,9 @@ def test_text_bank_encoder_frozen_and_cache_roundtrip(tmp_path):
 
 def test_motif_selection_preserves_entity_bridges():
     graph = _toy_trigraph()
-    selection = select_motif_core(
+    selection = select_anchor_nodes(
         graph,
-        config=MotifSelectorConfig(entity_ratio=1.0, sentence_budget=2, passage_budget=2),
+        config=AnchorSelectorConfig(entity_ratio=1.0, sentence_budget=2, passage_budget=2),
     )
     selected_types = graph.node_type[selection.core_node_ids]
     assert set(selected_types.tolist()) == {ENTITY, SENTENCE, PASSAGE}
@@ -128,7 +129,7 @@ def test_client_condensor_outputs_numeric_upload_only():
         graph_dim=graph.x.size(1),
         text_dim=bank.node_embeddings.size(1),
         config=ClientCondensationConfig(
-            motif=MotifSelectorConfig(entity_ratio=1.0, sentence_budget=2, passage_budget=2),
+            motif=AnchorSelectorConfig(entity_ratio=1.0, sentence_budget=2, passage_budget=2),
             topology_method="knn",
             knn_k=2,
             chunk_budget=4,
@@ -150,3 +151,32 @@ def test_fusion_gate_shape_and_range():
     assert x.shape == (6, 16)
     assert gate.shape == (6,)
     assert torch.all((gate >= 0) & (gate <= 1))
+
+
+def test_fusion_is_identity_additive_no_projection():
+    # x_fused must be LayerNorm(g + 0.5*t) exactly — no random Linear mixing.
+    fusion = GraphTextFusion(16, 16)
+    g = torch.randn(4, 16)
+    t = torch.randn(4, 16)
+    fused, _ = fusion(g, t)
+    expected = torch.nn.functional.layer_norm(g + 0.5 * t, (16,))
+    assert torch.allclose(fused, expected, atol=1e-5)
+
+
+def test_fusion_rejects_dim_mismatch():
+    import pytest
+    with pytest.raises(ValueError):
+        GraphTextFusion(16, 32)
+
+
+def test_score_and_select_prefers_relevant_neighbors():
+    g_v = torch.zeros(8)
+    g_v[0] = 1.0
+    noise = torch.zeros(8)
+    noise[1] = 1.0       # orthogonal to g_v, listed FIRST (old first-k picked this)
+    relevant = torch.zeros(8)
+    relevant[0] = 1.0    # aligned with g_v
+    embs = torch.stack([noise, relevant])
+    weights = score_and_select(g_v, embs, budget=1)
+    assert weights[1] > 0
+    assert weights[0] == 0

@@ -80,8 +80,8 @@ def preprocess_one(dataset_name: str, num_clients: int, verbose: bool = True) ->
 def main():
     parser = argparse.ArgumentParser(description="Preprocess LinearRAG datasets into per-client chunks.")
     parser.add_argument("--dataset", default="hotpotqa",
-                        choices=ALL_DATASETS + ["all"],
-                        help="Dataset to process (or 'all')")
+                        help="Dataset under dataset/linearrag/ to process, or 'all' "
+                             f"for the standard set {ALL_DATASETS}")
     parser.add_argument("--num_clients", type=int, default=5,
                         help="Number of federated clients (default: 5)")
     args = parser.parse_args()

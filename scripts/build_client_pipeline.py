@@ -249,7 +249,7 @@ def process_client(dataset: str, client_id: int, force: bool, topology_method: s
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build trigraph + condensed + synthetic for all clients.")
     parser.add_argument("--dataset", default="hotpotqa",
-                        choices=["hotpotqa", "2wikimultihop", "musique", "medical"])
+                        )
     parser.add_argument("--clients", type=int, nargs="+",
                         help="Client IDs to process (default: all with chunks.json)")
     parser.add_argument("--force", action="store_true",

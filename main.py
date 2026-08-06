@@ -1,7 +1,7 @@
 """FedCondGraphRAG unified entry point.
 
 Subcommands:
-    preprocess   Build per-client Stage A→B→C artifacts (chunks, trigraph, …).
+    preprocess   Build per-client Stage A→B→C artifacts + QA dataset + PPR maps.
     fl-train     Run the federated round loop (Stage C aggregation).
     train        Centralized Stage D fit (dual-prompting DualGraphLLM).
     infer        Run Stage D inference and compute eval metrics.
@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,6 +25,10 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("preprocess", help="Build Stage A→C artifacts per client").set_defaults(func=_run_preprocess)
     sub.add_parser("fl-train",   help="Run the federated round loop").set_defaults(func=_run_fl_train)
+    sub.add_parser("hipporag-baseline", add_help=False,
+                   help="Run local-only HippoRAG baseline per client").set_defaults(func=_run_hipporag_baseline)
+    sub.add_parser("linearrag-baseline", add_help=False,
+                   help="Run local-only LinearRAG baseline per client").set_defaults(func=_run_linearrag_baseline)
     sub.add_parser("train",      help="Stage D centralized fit").set_defaults(func=_run_train)
     sub.add_parser("infer",      help="Stage D inference + metrics").set_defaults(func=_run_infer)
 
@@ -66,7 +73,38 @@ def _run_preprocess(argv: list[str]) -> int:
         build_argv += ["--entity-ratio", str(known.entity_ratio)]
     sys.argv = build_argv
     runpy.run_module("scripts.build_client_pipeline", run_name="__main__")
+
+    # Step 4: build fedcond_qa dataset (q_embs.pt, records.jsonl, train/val/test splits)
+    import scripts.build_fedcond_qa_dataset as _bq  # noqa: F401
+    sys.argv = ["build_fedcond_qa_dataset.py", "--dataset", known.dataset]
+    runpy.run_module("scripts.build_fedcond_qa_dataset", run_name="__main__")
+
+    # Step 5: per-client PPR node maps — run all clients in parallel
+    _build_ppr_maps_parallel(known.dataset, known.num_clients, known.force)
+
     return 0
+
+
+def _build_ppr_maps_parallel(dataset: str, num_clients: int, force: bool) -> None:
+    """Build ppr_node_map.pt for each client sequentially.
+
+    Sequential (not parallel) to avoid RAM contention — each client needs
+    ~18 GB for parquet loading; parallel would exhaust memory on most machines.
+    Checkpointing inside preprocess_fedcond_qa.py means a killed run resumes
+    from the last completed batch rather than starting over.
+    """
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    force_flag = ["--force"] if force else []
+
+    for c in range(num_clients):
+        print(f"[ppr] client_{c} ...")
+        rc = subprocess.call(
+            [sys.executable, "scripts/preprocess_fedcond_qa.py",
+             "--dataset", dataset, "--client-id", str(c)] + force_flag,
+            env=env,
+        )
+        if rc != 0:
+            raise RuntimeError(f"PPR map build failed for client_{c} (exit code {rc})")
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +123,12 @@ def _run_fl_train(argv: list[str]) -> int:
     p.add_argument("--data-root", dest="data_root", default="processed")
     p.add_argument("--num-global-syn-nodes", dest="num_global_syn_nodes", type=int, default=128)
     p.add_argument("--server-condense-iters", dest="server_condense_iters", type=int, default=50)
+    p.add_argument("--server-stage-c-mode", dest="server_stage_c_mode", default="repr_align",
+                   choices=["gradient_match", "repr_align", "both"])
+    p.add_argument("--lambda-div", dest="lambda_div", type=float, default=0.1)
+    p.add_argument("--lambda-deg", dest="lambda_deg", type=float, default=0.05)
+    p.add_argument("--repr-align-weight", dest="repr_align_weight", type=float, default=1.0)
+    p.add_argument("--grad-match-weight", dest="grad_match_weight", type=float, default=1.0)
     p.add_argument("--hid-dim", dest="hid_dim", type=int, default=64)
     p.add_argument("--num-layers", dest="num_layers", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.0)
@@ -99,8 +143,8 @@ def _run_fl_train(argv: list[str]) -> int:
     p.add_argument("--eval-max-new-tokens", dest="eval_max_new_tokens", type=int, default=16,
                    help="Max tokens to generate during eval/inference (default 16; hotpotqa answers are short)")
     p.add_argument("--eval-every", dest="eval_every", type=int, default=1, help="Run accuracy eval every N rounds (default: every round)")
-    p.add_argument("--gnn-model-name", dest="gnn_model_name", default="gt")
-    p.add_argument("--gnn-model-name-c", dest="gnn_model_name_c", default="gat")
+    p.add_argument("--gnn-model-name", dest="gnn_model_name", default="gcn")
+    p.add_argument("--gnn-model-name-c", dest="gnn_model_name_c", default="gcn")
     p.add_argument("--gnn-in-dim", dest="gnn_in_dim", type=int, default=384)
     p.add_argument("--gnn-hidden-dim", dest="gnn_hidden_dim", type=int, default=384)
     p.add_argument("--gnn-num-layers", dest="gnn_num_layers", type=int, default=4)
@@ -120,10 +164,15 @@ def _run_fl_train(argv: list[str]) -> int:
                    help="Cap training samples per client per round (0 = all)")
     p.add_argument("--max-eval-samples", dest="max_eval_samples", type=int, default=200,
                    help="Max eval samples for per-round accuracy (default 200)")
-    p.add_argument("--dual-graph-mode", dest="dual_graph_mode", default="both",
+    p.add_argument("--no-fedavg", dest="no_fedavg", action="store_true", default=False,
+                   help="Ablation: skip FedAvg weight aggregation — clients train independently without sharing GNN/projector weights.")
+    p.add_argument("--dual-graph-mode", dest="dual_graph_mode", default="shared",
                    choices=["both", "dual", "evidence_only", "condensed_only",
                             "random_condensed", "none", "text_only", "shared", "no_synthetic"],
                    help="Graph soft-prompt mode. 'shared'=one shared GNN encoder; 'no_synthetic'=ignore server graph, both slots use evidence graph.")
+    p.add_argument("--llm-frozen", dest="llm_frozen", default="True", choices=["True", "False"],
+                   help="'False' enables LoRA finetuning of the LLM (QLoRA with --llm-load-in-4bit); "
+                        "LoRA adapters are trained locally and FedAvg-aggregated each round.")
     p.add_argument("--wandb-run-name", dest="wandb_run_name", default=None,
                    help="WandB run display name. Auto-generated from dual_graph_mode if omitted.")
     p.add_argument("--wandb-tags", dest="wandb_tags", nargs="+", default=None,
@@ -139,6 +188,29 @@ def _run_fl_train(argv: list[str]) -> int:
                    help="Number of re-ranked passages used as graph subgraph anchors "
                         "(default = --top-r-passages). Useful for using all 10 passages as "
                         "text but anchoring the evidence graph on the top-3 only.")
+    p.add_argument("--desc-source", dest="desc_source", default="ppr",
+                   choices=["ppr", "gold", "none", "file"],
+                   help="LLM text input: 'ppr' (default) = rank-ordered text of the PPR-retrieved "
+                        "passage nodes (what the R@k metrics measure); 'gold' = pre-built dataset "
+                        "desc (gold evidence passages); 'none' = empty desc, the LLM sees only "
+                        "the question (no-retrieval ablation); 'file' = per-question desc from "
+                        "--desc-file (external-retriever ablation).")
+    p.add_argument("--desc-file", dest="desc_file", default="",
+                   help="jsonl with {'id': question_id, 'desc': text} used when "
+                        "--desc-source file (build via scripts/build_desc_from_baseline_retrieval.py).")
+    p.add_argument("--ppr-map-name", dest="ppr_map_name", default="",
+                   help="Alternative per-client PPR map filename (e.g. ppr_node_map_top10.pt, "
+                        "built via preprocess_fedcond_qa.py --top_k_passages 10 --out-suffix _top10).")
+    p.add_argument("--eval-only", dest="eval_only", action="store_true", default=False,
+                   help="Skip training: run one artifact-exchange round, optionally load "
+                        "--load-checkpoint, evaluate val+test, and exit.")
+    p.add_argument("--load-checkpoint", dest="load_checkpoint", default="",
+                   help="checkpoints/<run>.pt saved by a previous fl-train (graph modules + "
+                        "LoRA); loaded with strict=False before --eval-only evaluation.")
+    p.add_argument("--eval-broadcast", dest="eval_broadcast", action="store_true", default=False,
+                   help="Every client answers ALL eval questions on its local shard "
+                        "(metrics averaged over clients) instead of only the questions "
+                        "it owns via idx %% num_clients.")
     args = p.parse_args(argv)
 
     from fedcond_grag.trainer import FedTrainer
@@ -148,6 +220,18 @@ def _run_fl_train(argv: list[str]) -> int:
         seed_everything(args.seed)
     FedTrainer(args).train()
     return 0
+
+
+def _run_hipporag_baseline(argv: list[str]) -> int:
+    from fedcond_grag.baselines.graph_rag.hipporag_local import main as run_hipporag_local
+
+    return run_hipporag_local(argv)
+
+
+def _run_linearrag_baseline(argv: list[str]) -> int:
+    from fedcond_grag.baselines.graph_rag.linearrag_local import main as run_linearrag_local
+
+    return run_linearrag_local(argv)
 
 
 # ---------------------------------------------------------------------------

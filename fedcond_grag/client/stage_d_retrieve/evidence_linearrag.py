@@ -136,17 +136,21 @@ class EvidenceLinearRAG(LinearRAGRetriever):
         """Build lookup arrays from embedding stores — called once after index()."""
         rag = self._rag
         rag.entity_hash_ids = list(rag.entity_embedding_store.hash_id_to_text.keys())
-        rag.entity_embeddings = np.array(rag.entity_embedding_store.embeddings)
+        rag.entity_embeddings = rag.entity_embedding_store.embeddings  # already 2D float32
         rag.passage_hash_ids = list(rag.passage_embedding_store.hash_id_to_text.keys())
-        rag.passage_embeddings = np.array(rag.passage_embedding_store.embeddings)
+        rag.passage_embeddings = rag.passage_embedding_store.embeddings
         rag.sentence_hash_ids = list(rag.sentence_embedding_store.hash_id_to_text.keys())
-        rag.sentence_embeddings = np.array(rag.sentence_embedding_store.embeddings)
+        rag.sentence_embeddings = rag.sentence_embedding_store.embeddings
         rag.node_name_to_vertex_idx = {
             v["name"]: v.index for v in rag.graph.vs if "name" in v.attributes()
         }
         rag.vertex_idx_to_node_name = {
             v.index: v["name"] for v in rag.graph.vs if "name" in v.attributes()
         }
+        # Pin entity embeddings on GPU for fast per-query similarity search
+        if rag.device.type == 'cuda':
+            import torch
+            rag.entity_embeddings_gpu = torch.from_numpy(rag.entity_embeddings).to(rag.device)
         self._prepared = True
 
     def retrieve_with_evidence(
@@ -156,6 +160,8 @@ class EvidenceLinearRAG(LinearRAGRetriever):
         """Like retrieve() but returns EvidenceRetrievalResult with intermediate state.
 
         Must call index() first.
+        Processes the batch with a single SpaCy pipe() call and batched question encoding
+        to avoid per-question model overhead.
         """
         if not self._indexed:
             raise RuntimeError("Call index() before retrieve_with_evidence()")
@@ -165,22 +171,55 @@ class EvidenceLinearRAG(LinearRAGRetriever):
 
         rag = self._rag
 
+        # Batch SpaCy NER — one nlp.pipe() call for all questions (vs. loading model per question)
+        question_texts = [q["question"] for q in questions]
+        batch_ner_entities: list[set[str]] = rag.spacy_ner.batch_question_ner(question_texts)
+
+        # Batch-encode all question texts at once
+        q_embeddings = rag.config.embedding_model.encode(
+            question_texts,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=rag.config.batch_size,
+        )
+
         results = []
-        for q_info in questions:
-            question = q_info["question"]
-            q_emb = rag.config.embedding_model.encode(
-                question,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-                batch_size=rag.config.batch_size,
-            )
-            seed_idx, seed_ents, seed_hids, seed_scores = rag.get_seed_entities(question)
+        for idx, q_info in enumerate(questions):
+            question = question_texts[idx]
+            q_emb = q_embeddings[idx]
+            question_entities = list(batch_ner_entities[idx])
+
+            if question_entities:
+                # Encode only the small set of NER entities for this question
+                q_ent_embs = rag.config.embedding_model.encode(
+                    question_entities,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    batch_size=rag.config.batch_size,
+                )
+                # GPU similarity if available, else CPU
+                if hasattr(rag, 'entity_embeddings_gpu'):
+                    import torch
+                    q_t = torch.from_numpy(q_ent_embs).to(rag.device)
+                    similarities = torch.mm(rag.entity_embeddings_gpu, q_t.T).cpu().numpy()
+                else:
+                    similarities = np.dot(rag.entity_embeddings, q_ent_embs.T)
+
+                seed_idx, seed_ents, seed_hids, seed_scores = [], [], [], []
+                for ei in range(len(question_entities)):
+                    col = similarities[:, ei]
+                    best = int(np.argmax(col))
+                    seed_idx.append(best)
+                    seed_ents.append(rag.entity_embedding_store.hash_id_to_text[rag.entity_hash_ids[best]])
+                    seed_hids.append(rag.entity_hash_ids[best])
+                    seed_scores.append(float(col[best]))
+            else:
+                seed_ents = []
 
             if seed_ents:
                 sorted_hids, sorted_scores = rag.graph_search_with_seed_entities(
                     question, q_emb, seed_idx, seed_ents, seed_hids, seed_scores
                 )
-                # _CaptureLinearRAG saves actived_entities here
                 actived = dict(rag._last_actived_entities)
                 top_k = rag.config.retrieval_top_k
                 top_hids = sorted_hids[:top_k]
@@ -195,7 +234,6 @@ class EvidenceLinearRAG(LinearRAGRetriever):
                     rag.passage_embedding_store.texts[i] for i in sorted_idx[:top_k]
                 ]
                 sorted_hids = [rag.passage_hash_ids[i] for i in sorted_idx]
-                sorted_scores = sorted_scores
                 actived = {}
 
             results.append(

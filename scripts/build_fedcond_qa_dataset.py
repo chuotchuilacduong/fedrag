@@ -32,6 +32,33 @@ TOP_K_DESC = 5          # passages to include in LLM desc
 ENCODE_BATCH = 512
 
 
+def _evidence_to_text(item) -> str:
+    """Normalize supported evidence shapes into one passage-like text string."""
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, (list, tuple)):
+        if len(item) == 2 and isinstance(item[1], (list, tuple)):
+            title, sentences = item
+            body = " ".join(str(s).strip() for s in item[1][:3] if str(s).strip())
+            return f"{title}: {body}" if str(title).strip() else body
+        if len(item) >= 3:
+            subj, rel, obj = item[:3]
+            return f"{subj}: {rel} {obj}".strip()
+        if len(item) == 2:
+            return f"{item[0]}: {item[1]}".strip()
+    return str(item).strip()
+
+
+def _question_evidence(q: dict) -> list:
+    evidence = q.get("evidence", [])
+    if evidence:
+        return evidence if isinstance(evidence, list) else [evidence]
+    evidence_relations = q.get("evidence_relations", [])
+    if evidence_relations:
+        return evidence_relations if isinstance(evidence_relations, list) else [evidence_relations]
+    return []
+
+
 def _collect_passages(questions: list[dict]) -> tuple[list[list[str]], list[str]]:
     """Return per-question passage lists and deduplicated unique passage list."""
     seen: dict[str, int] = {}
@@ -39,8 +66,10 @@ def _collect_passages(questions: list[dict]) -> tuple[list[list[str]], list[str]
     per_q: list[list[str]] = []
     for q in questions:
         plist: list[str] = []
-        for title, sentences in q.get("evidence", []):
-            text = f"{title}: {' '.join(str(s).strip() for s in sentences[:3])}"
+        for item in _question_evidence(q):
+            text = _evidence_to_text(item)
+            if not text:
+                continue
             plist.append(text)
             if text not in seen:
                 seen[text] = len(unique)
@@ -52,13 +81,18 @@ def _collect_passages(questions: list[dict]) -> tuple[list[list[str]], list[str]
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="hotpotqa",
-                        choices=["hotpotqa", "musique", "2wikimultihop", "medical"])
+                        )
     parser.add_argument("--top-k-desc", type=int, default=TOP_K_DESC,
                         help="Number of cosine-ranked passages to use as LLM desc")
+    parser.add_argument("--out-root", default=None,
+                        help="Output dir (default dataset/fedcond_qa — the legacy shared dir "
+                             "currently holding 2wikimultihop). Use a per-dataset dir, e.g. "
+                             "dataset/fedcond_qa/musique, to avoid clobbering it; pass the "
+                             "same path to fl-train via --qa-data-root.")
     args = parser.parse_args()
 
     processed_root = _ROOT / "processed" / args.dataset
-    out_root = _ROOT / "dataset" / "fedcond_qa"
+    out_root = Path(args.out_root) if args.out_root else _ROOT / "dataset" / "fedcond_qa"
 
     from sentence_transformers import SentenceTransformer
 

@@ -128,7 +128,9 @@ def test_gfl_registry_loads_fedcond_qa_components(tmp_path):
     torch.manual_seed(17)
     device = torch.device("cpu")
     args = _args(tmp_path, num_syn_nodes=6)
-    graph = _toy_anchor()
+    # 384 = MiniLM dim — Stage B identity fusion requires graph_dim == text_dim,
+    # matching the production invariant (trigraph.x and text bank are both MiniLM).
+    graph = _toy_anchor(num_features=384)
     message_pool = {"sampled_clients": [0], "round": 0}
 
     task = load_task(args, 0, graph, str(tmp_path), device)

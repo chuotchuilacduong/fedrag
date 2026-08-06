@@ -365,8 +365,10 @@ class FedCondQAServer:
 
     def _fedavg_model_weights(self) -> None:
         """FedAvg GNN encoder + projector weights from sampled clients."""
+        if getattr(self.args, "no_fedavg", False):
+            return
         sampled = self.message_pool.get("sampled_clients", [])
-        _WEIGHT_KEYS = ("graph_encoder", "projector", "condensed_encoder", "projector_c")
+        _WEIGHT_KEYS = ("graph_encoder", "projector", "condensed_encoder", "projector_c", "lora")
 
         client_entries: list[tuple[dict, int]] = []
         for cid in sampled:

@@ -48,9 +48,9 @@ def _ner_worker(args: tuple) -> tuple[dict, dict]:
 class SpacyNER:
     def __init__(self, spacy_model: str = "en_core_web_sm"):
         self.spacy_model = spacy_model
-        # Validate model exists (fail fast)
         import spacy as _spacy
-        _spacy.load(spacy_model, disable=["parser"])
+        # Load once and cache — question_ner reuses this instead of calling spacy.load() per question
+        self._nlp = _spacy.load(spacy_model, disable=["parser"])
 
     def batch_ner(
         self,
@@ -100,11 +100,16 @@ class SpacyNER:
         return passage_to_ents, dict(sentence_to_ents)
 
     def question_ner(self, question: str) -> set[str]:
-        import spacy
-        nlp = spacy.load(self.spacy_model, disable=["parser"])
-        doc = nlp(question)
+        doc = self._nlp(question)
         return {
             ent.text.lower()
             for ent in doc.ents
             if ent.label_ not in ("ORDINAL", "CARDINAL")
         }
+
+    def batch_question_ner(self, questions: list[str]) -> list[set[str]]:
+        """Run NER on a list of questions using nlp.pipe() — much faster than calling question_ner() in a loop."""
+        return [
+            {ent.text.lower() for ent in doc.ents if ent.label_ not in ("ORDINAL", "CARDINAL")}
+            for doc in self._nlp.pipe(questions, batch_size=64)
+        ]

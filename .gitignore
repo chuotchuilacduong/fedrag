@@ -49,9 +49,22 @@ coverage.xml
 # Output
 *.out
 *.txt
+!third_party/HippoRAG/requirements.txt
 
 # Sphinx documentation
 docs/_build/
+
+# Large data / vendored deps / benchmark sets (excluded from git)
+third_party/
+dataset/ner/
+dataset/linearrag/2wikifed/
+dataset/linearrag/hotpotqafed/
+dataset/linearrag/musiquefed/
+2wikimultihopqa_test/
+hotpotqa_test/
+musique_test/
+metrics/
+*.pdf
 
 
 # logs and results
