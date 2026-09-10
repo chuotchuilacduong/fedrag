@@ -67,6 +67,7 @@ class FedTrainer:
             self._load_checkpoint(load_ckpt)
 
         self._metrics_path = Path(getattr(args, "metrics_path", "/tmp/fl_metrics.jsonl"))
+        self._metrics_path.parent.mkdir(parents=True, exist_ok=True)
         self._metrics_path.write_text("")   # reset on new run
 
         self._save_best_path = getattr(args, "save_best_path", None)
@@ -617,6 +618,7 @@ class FedTrainer:
               "-- raise it if this is less than your test set size)", flush=True)
         dump_path = getattr(self.args, "dump_predictions", None)
         if dump_path:
+            Path(dump_path).parent.mkdir(parents=True, exist_ok=True)
             Path(dump_path).write_text("")   # reset on new run, like _metrics_path
         test_metrics = self._eval_split_acc(self._test_samples, dump_predictions_path=dump_path)
         print(f"    test  : hit {test_metrics['hit']:.2f}% | "
