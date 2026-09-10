@@ -179,9 +179,25 @@ def _load_or_fit_clusters(
                     np.load(emb_path),
                 )
 
-    from fedcond_grag.client.stage_b_condense.node_text_embedder import load_frozen_encoder
+    # NOT load_frozen_encoder(): that helper silently falls back to a
+    # dependency-free HashTextEncoder (no real semantics, no .tokenizer) if
+    # SentenceTransformer fails to load for ANY reason -- fine for Stage B's
+    # resilience use case, but fatal here: a hash "embedding" would silently
+    # produce meaningless topic clusters instead of failing loudly.
+    from sentence_transformers import SentenceTransformer
 
-    model = load_frozen_encoder()
+    try:
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+    except Exception as exc:
+        raise RuntimeError(
+            "Topic-skew partitioning requires the real all-MiniLM-L6-v2 "
+            "SentenceTransformer (not the HashTextEncoder fallback used "
+            "elsewhere in this repo) -- it failed to load, see the chained "
+            "exception above for the actual cause (network/HF Hub access, "
+            "a sentence-transformers/torch version mismatch, etc.)."
+        ) from exc
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
     embeddings = embed_article_groups(groups, model)
     topic_ids, centers = fit_topic_clusters(embeddings, n_clusters=n_clusters, seed=seed)
 
