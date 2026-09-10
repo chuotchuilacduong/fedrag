@@ -35,7 +35,16 @@ pip install -r requirements.txt
 # transformers (dù ở một máy khác có thể không bị, tuỳ bản pip resolve ra).
 # Gỡ luôn cho chắc -- transformers tự fallback về không có chúng:
 python -m pip uninstall -y torchvision torchaudio
+
+# spaCy model cho Stage A (LinearRAG NER) -- pip install không tự tải model,
+# thiếu bước này sẽ crash ngay chunk đầu tiên với
+# "OSError: [E050] Can't find model 'en_core_web_sm'"
+python -m spacy download en_core_web_sm
 ```
+
+Luôn dùng `python -m pip ...` thay vì `pip ...` trần -- trên một số máy `pip`
+trỏ tới `~/.local/bin/pip` (user-level, bỏ qua conda env đang active) trong
+khi `python` trỏ đúng vào env, gây cài nhầm chỗ mà không có cảnh báo rõ ràng.
 
 Model LLM tự tải từ HuggingFace ở lần chạy đầu (Qwen2.5-1.5B-Instruct ~3GB,
 Qwen2.5-7B-Instruct ~15GB). Nếu mạng chậm/hay đứt, tải trước cho chắc:
