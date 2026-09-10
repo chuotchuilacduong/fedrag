@@ -90,6 +90,14 @@ class FedCondQAServer:
         self.global_lora: dict | None = None
         self.shared_llm_model = None
 
+        # Regularization-diversity ablation instrumentation (opt-in, no
+        # effect unless a caller sets phase1_callback or reads the
+        # last_phase*_components dicts). See _repr_align_aux_components /
+        # _server_reg_step for what populates these.
+        self.phase1_callback = None  # Callable[[FedCondQAServer, int, int], None] | None
+        self.last_phase1_components: dict | None = None
+        self.last_phase2_components: dict | None = None
+
     def set_shared_llm_model(self, model) -> None:
         """Register the shared PEFT-wrapped LLM (DualGraphLLM.model) so LoRA
         aggregation strategies can read/merge its weights. Called once by
@@ -162,8 +170,19 @@ class FedCondQAServer:
                 anchor_h_list = precompute_anchor_reprs(
                     anchor_graphs, self.repr_encoder, self.repr_projector, self.device
                 )
-                for _ in range(max(1, num_steps)):
+                # Unlike the other modes below, 0 here means "skip Phase-I
+                # entirely" (X_syn stays at its raw random-sample+noise init
+                # from init_synthetic_graph) -- an actual ablation switch, via
+                # --server-condense-iters 0. The other modes floor at 1 step
+                # because they have no meaningful "off" state; fedrag's Phase-I
+                # does.
+                n_steps = max(0, num_steps)
+                if self.phase1_callback is not None:
+                    self.phase1_callback(self, 0, n_steps)   # init, before update 1
+                for step in range(1, n_steps + 1):
                     last_loss = self.server_repr_align_step(anchor_h_list)
+                    if self.phase1_callback is not None:
+                        self.phase1_callback(self, step, n_steps)
 
         elif mode == "gradient_match":
             anchor_gradients = self.compute_anchor_gradients(anchor_graphs)
@@ -328,16 +347,42 @@ class FedCondQAServer:
                 node_type=self.synthetic_node_type.detach().clone(),
             )
 
-    def _repr_align_aux_loss(self, h_syn: Tensor, adj_for_deg: Tensor | None = None) -> Tensor:
-        """Auxiliary diversity + degree losses, zero if lambdas are 0."""
-        loss = h_syn.new_zeros(())
+    def _server_reg_disabled(self) -> bool:
+        """--disable-server-reg: isolates SERVER-side L_reg only (paper Phase
+        I + II synthetic-graph regularization). Never touches client-side
+        losses (L_mem's --lambda-div-mem/--lambda-deg-mem, --lambda-reg-mem,
+        Stage-B --stage-b-lambda-div, etc.) -- see main.py's --disable-server-reg
+        help text."""
+        return bool(getattr(self.args, "disable_server_reg", False))
+
+    def _repr_align_aux_components(
+        self, h_syn: Tensor, adj_for_deg: Tensor | None = None
+    ) -> dict[str, Tensor]:
+        """Diversity + degree components of the Phase-I init aux loss.
+
+        Returns zero tensors (not merely zero-weighted) for both terms when
+        --disable-server-reg is set, so the "no-reg" arm's Phase-I objective
+        is exactly L_init = L_align, matching the ablation's full/no-reg
+        semantics rather than a numerically-near-zero weighted term.
+        """
+        zero = h_syn.new_zeros(())
+        if self._server_reg_disabled():
+            return {"div": zero, "deg": zero}
         lambda_div = float(getattr(self.args, "lambda_div", 0.0))
-        if lambda_div > 0:
-            loss = loss + lambda_div * diversity_loss(h_syn)
+        div = lambda_div * diversity_loss(h_syn) if lambda_div > 0 else zero
         lambda_deg = float(getattr(self.args, "lambda_deg", 0.0))
-        if lambda_deg > 0 and adj_for_deg is not None:
-            loss = loss + lambda_deg * degree_regularization(adj_for_deg, self._target_anchor_degree)
-        return loss
+        deg = (
+            lambda_deg * degree_regularization(adj_for_deg, self._target_anchor_degree)
+            if lambda_deg > 0 and adj_for_deg is not None
+            else zero
+        )
+        return {"div": div, "deg": deg}
+
+    def _repr_align_aux_loss(self, h_syn: Tensor, adj_for_deg: Tensor | None = None) -> Tensor:
+        """Auxiliary diversity + degree losses, zero if lambdas are 0 (or
+        --disable-server-reg is set -- see _repr_align_aux_components)."""
+        components = self._repr_align_aux_components(h_syn, adj_for_deg)
+        return components["div"] + components["deg"]
 
     def server_repr_align_step(self, anchor_h_list: list[Tensor]) -> Tensor:
         """One optimization step using representation alignment (Lalign + aux losses).
@@ -362,13 +407,20 @@ class FedCondQAServer:
             self.repr_encoder, self.repr_projector,
         )
 
-        loss = representation_alignment_loss(h_syn, anchor_h_list)
-        loss = loss + self._repr_align_aux_loss(h_syn, adj_soft)
+        loss_align = representation_alignment_loss(h_syn, anchor_h_list)
+        aux = self._repr_align_aux_components(h_syn, adj_soft)
+        loss = loss_align + aux["div"] + aux["deg"]
 
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
         self._update_best_state(loss)
+        self.last_phase1_components = {
+            "total": float(loss.detach().cpu()),
+            "align": float(loss_align.detach().cpu()),
+            "div": float(aux["div"].detach().cpu()),
+            "deg": float(aux["deg"].detach().cpu()),
+        }
         return loss
 
     def server_combined_step(
@@ -461,6 +513,16 @@ class FedCondQAServer:
             self.pge.load_state_dict(pge_sd)
 
         last = None
+        if self._server_reg_disabled():
+            # No-reg arm (paper Phase II): aggregate the client synthetic-
+            # memory deltas exactly as normal (above), then SKIP the server
+            # L_reg gradient step entirely -- not merely zero-weighted, so
+            # this arm performs no server-side regularization update at all.
+            self.last_phase2_components = {
+                "enabled": False, "reg_steps": 0,
+                "total": 0.0, "div": 0.0, "deg": 0.0,
+            }
+            return last
         reg_steps = int(getattr(self.args, "server_reg_steps", 1))
         eta_reg = float(getattr(self.args, "eta_reg", 1e-2))
         for _ in range(max(0, reg_steps)):
@@ -481,17 +543,24 @@ class FedCondQAServer:
             self.synthetic_x, edge_index, edge_weight,
             self.repr_encoder, self.repr_projector,
         )
-        loss = (
-            float(getattr(self.args, "lambda_div", 0.1)) * diversity_loss(h_syn)
-            + float(getattr(self.args, "lambda_deg", 0.05))
-            * degree_regularization(adj_soft, self._target_anchor_degree)
+        loss_div = float(getattr(self.args, "lambda_div", 0.1)) * diversity_loss(h_syn)
+        loss_deg = float(getattr(self.args, "lambda_deg", 0.05)) * degree_regularization(
+            adj_soft, self._target_anchor_degree
         )
+        loss = loss_div + loss_deg
         params = [self.synthetic_x, *self.pge.parameters()]
         grads = torch.autograd.grad(loss, params, allow_unused=True)
         with torch.no_grad():
             for param, grad in zip(params, grads):
                 if grad is not None:
                     param.sub_(eta_reg * grad)
+        self.last_phase2_components = {
+            "enabled": True,
+            "reg_steps": int(getattr(self.args, "server_reg_steps", 1)),
+            "total": float(loss.detach().cpu()),
+            "div": float(loss_div.detach().cpu()),
+            "deg": float(loss_deg.detach().cpu()),
+        }
         return loss.detach()
 
     def _fedavg_model_weights(self) -> None:
@@ -645,6 +714,44 @@ class FedCondQAServer:
         )
         data.num_global_classes = 3
         return data
+
+    def synthetic_memory_state_dict(self) -> dict:
+        """Full, checkpointable snapshot of the learned synthetic memory
+        Theta_syn = {X_syn, theta_PGE} -- everything `LocalSyntheticMemory.
+        from_broadcast` / the client-side condensed retrieval path need to
+        reconstruct the exact synthetic graph this server currently holds,
+        as opposed to `export_synthetic_graph()`'s realized Data object
+        (which is derived FROM this state and is not itself sufficient to
+        resume/re-broadcast the learned memory bit-for-bit)."""
+        if self.synthetic_x is None or self.synthetic_node_type is None or self.pge is None:
+            raise RuntimeError("Synthetic graph is not initialized -- nothing to snapshot")
+        return {
+            "x": self.synthetic_x.detach().cpu().clone(),
+            "node_type": self.synthetic_node_type.detach().cpu().clone(),
+            "pge_state": {k: v.detach().cpu().clone() for k, v in self.pge.state_dict().items()},
+            "pge_config": dict(self._pge_config) if self._pge_config is not None else None,
+            "target_degree": float(self._target_anchor_degree),
+        }
+
+    def load_synthetic_memory_state_dict(self, state: dict) -> None:
+        """Inverse of `synthetic_memory_state_dict()` -- restores X_syn and
+        theta_PGE exactly, so a checkpointed synthetic memory can be
+        broadcast without re-running Phase-0 reconstruction (which would
+        produce a DIFFERENT Theta_syn, not the one the rest of the
+        checkpoint's condensed_encoder/projector_c were actually trained
+        against)."""
+        if state.get("pge_config") is None:
+            raise RuntimeError(
+                "Checkpoint's synthetic_memory has no pge_config -- was it saved "
+                "before the server ever initialized Theta_syn (--server-stage-c-mode "
+                "fedrag Phase 0)?"
+            )
+        self._pge_config = dict(state["pge_config"])
+        self.pge = TypeAwarePGE(**self._pge_config).to(self.device)
+        self.pge.load_state_dict({k: v.to(self.device) for k, v in state["pge_state"].items()})
+        self.synthetic_x = nn.Parameter(state["x"].to(self.device).float())
+        self.synthetic_node_type = state["node_type"].to(self.device).long()
+        self._target_anchor_degree = float(state.get("target_degree", 8.0))
 
     def get_override_evaluate(self):
         def override_evaluate(splitted_data=None, mute=False):

@@ -77,13 +77,29 @@ class FedCondQAClient:
         self._train_pool_max_per_round: int = 0
 
     def _load_ppr_node_map(self) -> "torch.Tensor | None":
-        """Load this client's per-query PPR node map if available."""
-        data_root = getattr(self.args, "data_root", "processed")
-        dataset = getattr(self.args, "dataset", "")
-        if isinstance(dataset, (list, tuple)):  # GFL-style configs pass a list
-            dataset = dataset[0] if dataset else ""
-        path = str(Path(data_root) / str(dataset))
-        map_path = Path(path) / f"client_{self.client_id}" / "ppr_node_map.pt"
+        """Load this client's per-query PPR node map if available.
+
+        Keyed off `self.data_dir` — the directory this client's trigraph was
+        actually loaded from — NOT off args.dataset. The map holds local node
+        IDs into *that* trigraph, so the two must come from the same place.
+        Deriving the path from args.dataset instead breaks any setup where a
+        client's graph is not the one args.dataset names: baselines/gretriever
+        builds a train client on processed/<ds>_train/ while args.dataset stays
+        "<ds>", so the train client loaded the EVAL map and indexed it with
+        train-sample indices -- anchors belonging to entirely different
+        questions. It surfaced as "No PPR anchor nodes" once the borrowed IDs
+        exceeded the train graph's node count (2wikimultihop: all 1000 rows;
+        musique: 64), and passed silently on hotpotqa, where the eval map's
+        max ID happened to fall below the train graph's N.
+        """
+        if getattr(self, "data_dir", None):
+            map_path = Path(self.data_dir) / "ppr_node_map.pt"
+        else:
+            data_root = getattr(self.args, "data_root", "processed")
+            dataset = getattr(self.args, "dataset", "")
+            if isinstance(dataset, (list, tuple)):  # GFL-style configs pass a list
+                dataset = dataset[0] if dataset else ""
+            map_path = Path(data_root) / str(dataset) / f"client_{self.client_id}" / "ppr_node_map.pt"
         if map_path.exists():
             m = torch.load(map_path, map_location="cpu", weights_only=True)
             print(f"    [client_{self.client_id}] Loaded ppr_node_map.pt {tuple(m.shape)}")
@@ -220,7 +236,11 @@ class FedCondQAClient:
             + (list(self.shared_model.projector_c.parameters())
                if self.shared_model.projector_c is not None else [])
         )
-        lora_enabled = has_lora(self.shared_model.model)
+        lora_enabled = has_lora(self.shared_model.model) and not getattr(self.args, "freeze_loaded_lora", False)
+        if getattr(self.args, "freeze_loaded_lora", False) and has_lora(self.shared_model.model):
+            for name, param in self.shared_model.model.named_parameters():
+                if ".lora_A." in name or ".lora_B." in name:
+                    param.requires_grad_(False)
         if lora_enabled:
             # RoLoRA alternates which half is trainable by round parity; every
             # other strategy just trains both halves every round. Both halves
@@ -355,11 +375,17 @@ class FedCondQAClient:
         _param = next(ctx_proj.parameters())
         device = _param.device
 
+        lambda_qa = float(getattr(self.args, "lambda_qa_mem", 1.0))
         lambda_gm = float(getattr(self.args, "lambda_gm", 0.1))
         lambda_align = float(getattr(self.args, "lambda_align_mem", 0.1))
         lambda_reg = float(getattr(self.args, "lambda_reg_mem", 0.01))
-        lambda_syn_div = float(getattr(self.args, "lambda_div", 0.1))
-        lambda_deg = float(getattr(self.args, "lambda_deg", 0.05))
+        # CLIENT-side L_reg components (paper B.4.2) inside L_mem -- distinct
+        # from --lambda-div/--lambda-deg, which are the SERVER-side Phase-I/II
+        # regularization coefficients ablated by --disable-server-reg. Kept as
+        # separate args so toggling server-side regularization never changes
+        # this client-side term (see main.py's --lambda-div-mem/--lambda-deg-mem).
+        lambda_syn_div = float(getattr(self.args, "lambda_div_mem", 0.1))
+        lambda_deg = float(getattr(self.args, "lambda_deg_mem", 0.05))
         tau = float(getattr(self.args, "syn_soft_tau", 0.1))
         lr = float(getattr(self.args, "syn_mem_lr", 1e-3))
         batch_size = int(getattr(self.args, "syn_mem_batch_size", 0)) or int(
@@ -448,7 +474,7 @@ class FedCondQAClient:
             )
 
             total = (
-                qa_term
+                lambda_qa * qa_term
                 + lambda_gm * loss_gm
                 + lambda_align * loss_align
                 + lambda_reg * loss_reg

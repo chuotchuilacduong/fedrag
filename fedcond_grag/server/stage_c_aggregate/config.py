@@ -37,8 +37,11 @@ config = {
     "server_reg_steps": 1,     # L_reg steps after delta aggregation
     "repr_align_weight": 1.0,
     "grad_match_weight": 1.0,
-    "lambda_div": 0.1,
+    "lambda_div": 0.1,     # server-side Phase-I/II regularization (ablated by --disable-server-reg)
     "lambda_deg": 0.05,
+    "lambda_div_mem": 0.1,  # client-side L_mem regularization (paper B.4.2) -- never ablated
+    "lambda_deg_mem": 0.05,
+    "disable_server_reg": False,
     "repr_proj_out_dim": 4096,
     "gnn_model_name": "gcn",
     "gnn_model_name_c": "gcn",

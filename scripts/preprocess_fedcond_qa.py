@@ -62,14 +62,18 @@ def _build_title_to_node(trigraph_path: Path) -> dict[str, int]:
     return title_to_node
 
 
-def _index_client(client_dir: Path, dataset: str) -> EvidenceLinearRAG:
+def _index_client(client_dir: Path, dataset: str, retrieval_top_k: int = 5) -> EvidenceLinearRAG:
     chunks_path = client_dir / "chunks.json"
     chunks = json.loads(chunks_path.read_text())
     encoder = load_encoder(ENCODER_MODEL)
+    # retrieval_top_k is the REAL cap on how many passages come back --
+    # LinearRAG slices to config.retrieval_top_k internally, so raising
+    # --top_k_passages alone does nothing: the map just gets -1 padding.
     retriever = EvidenceLinearRAG(
         working_dir=client_dir / "linearrag_cache",
         dataset_name=dataset,
         encoder=encoder,
+        retrieval_top_k=retrieval_top_k,
     )
     retriever.index(chunks)
     return retriever
@@ -80,6 +84,7 @@ def process_client(
     dataset: str,
     questions: list[dict],
     top_k: int,
+    retrieval_top_k: int = 5,
 ) -> None:
     """Run per-query PPR on one client and save ppr_node_map.pt."""
     cid = client_dir.name
@@ -91,7 +96,7 @@ def process_client(
 
     print(f"  Indexing chunks with LinearRAG...", flush=True)
     t0 = time.time()
-    retriever = _index_client(client_dir, dataset)
+    retriever = _index_client(client_dir, dataset, retrieval_top_k)
     print(f"  Indexed in {time.time()-t0:.0f}s", flush=True)
 
     Q = len(questions)
@@ -142,11 +147,16 @@ def process_client(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="hotpotqa",
-                        choices=["hotpotqa", "2wikimultihop", "musique", "medical",
-                                 "hotpotqa_train", "2wikimultihop_train", "musique_train"])
+                        help="Dataset name (one of the usual variants, or any other name with "
+                             "an existing processed/<name>/ tree, e.g. a topic-skew partition)")
     parser.add_argument("--max_questions", type=int, default=None)
     parser.add_argument("--top_k_passages", type=int, default=5,
                         help="Top-k PPR passages to map per client per question")
+    parser.add_argument("--retrieval-top-k", dest="retrieval_top_k", type=int, default=5,
+                        help="LinearRAG's own retrieval cap. This is the binding one: "
+                             "the retriever slices to config.retrieval_top_k before this "
+                             "script ever sees the passages, so --top_k_passages above "
+                             "this value only pads the map with -1.")
     parser.add_argument("--client-id", type=int, default=None,
                         help="Process only this client ID (0-indexed). If omitted, all clients.")
     args = parser.parse_args()
@@ -175,7 +185,8 @@ def main() -> None:
 
     t_total = time.time()
     for cdir in client_dirs:
-        process_client(cdir, args.dataset, questions, args.top_k_passages)
+        process_client(cdir, args.dataset, questions, args.top_k_passages,
+                       retrieval_top_k=args.retrieval_top_k)
 
     print(f"\nAll done in {time.time()-t_total:.0f}s")
     print("Each client's ppr_node_map.pt is saved under its own processed/ directory.")

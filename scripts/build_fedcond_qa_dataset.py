@@ -77,8 +77,8 @@ def _collect_passages(questions: list[dict]) -> tuple[list[list[str]], list[str]
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="hotpotqa",
-                        choices=["hotpotqa", "musique", "2wikimultihop", "medical",
-                                 "hotpotqa_train", "musique_train", "2wikimultihop_train"])
+                        help="Dataset name (one of the usual variants, or any other name with "
+                             "an existing processed/<name>/ tree, e.g. a topic-skew partition)")
     parser.add_argument("--top-k-desc", type=int, default=TOP_K_DESC,
                         help="Number of cosine-ranked passages to use as LLM desc")
     parser.add_argument("--out-root", default="dataset/fedcond_qa",

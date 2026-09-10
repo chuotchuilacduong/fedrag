@@ -52,9 +52,20 @@ def _run_preprocess(argv: list[str]) -> int:
 
     p = argparse.ArgumentParser(prog="fedcond_grag preprocess")
     p.add_argument("--dataset", default="hotpotqa",
-                   choices=["hotpotqa", "2wikimultihop", "musique", "medical",
-                            "hotpotqa_train", "2wikimultihop_train", "musique_train"])
+                   help="One of hotpotqa/2wikimultihop/musique/medical, a _train/_merged "
+                        "variant, or any other name whose dataset/linearrag/<name>/ already "
+                        "has chunks.json+questions.json (e.g. a topic-skew partition variant "
+                        "-- use --skip-download and point/symlink dataset/linearrag/<name> at "
+                        "the base corpus first).")
     p.add_argument("--num-clients", dest="num_clients", type=int, default=3)
+    p.add_argument("--partition-mode", dest="partition_mode", default="index",
+                   choices=["index", "random", "dirichlet"],
+                   help="Step 2 corpus partitioning strategy -- see scripts/preprocess_data.py "
+                        "--partition-mode.")
+    p.add_argument("--alpha", type=float, default=None,
+                   help="Dirichlet concentration, required for --partition-mode dirichlet.")
+    p.add_argument("--num-topic-clusters", dest="num_topic_clusters", type=int, default=20)
+    p.add_argument("--partition-seed", dest="partition_seed", type=int, default=42)
     p.add_argument("--force", action="store_true",
                    help="Rebuild all artifacts even if they exist")
     p.add_argument("--skip-download", dest="skip_download", action="store_true",
@@ -107,9 +118,15 @@ def _run_preprocess(argv: list[str]) -> int:
         runpy.run_module("scripts.setup_datasets", run_name="__main__")
 
     # 2. Partition corpus into per-client shards
-    _step(2, f"preprocess_data — {known.num_clients} client shards")
-    sys.argv = ["preprocess_data.py", "--dataset", known.dataset,
-                "--num_clients", str(known.num_clients)]
+    _step(2, f"preprocess_data — {known.num_clients} client shards ({known.partition_mode})")
+    part_argv = ["preprocess_data.py", "--dataset", known.dataset,
+                 "--num_clients", str(known.num_clients),
+                 "--partition-mode", known.partition_mode,
+                 "--num-topic-clusters", str(known.num_topic_clusters),
+                 "--partition-seed", str(known.partition_seed)]
+    if known.alpha is not None:
+        part_argv += ["--alpha", str(known.alpha)]
+    sys.argv = part_argv
     runpy.run_module("scripts.preprocess_data", run_name="__main__")
 
     # 3. Stage A (trigraph) → Stage B (condensed anchor) per client
@@ -209,6 +226,10 @@ def _run_fl_train(argv: list[str]) -> int:
                    help="Mini-batch size for memory adaptation (0 = --local-batch-size)")
     p.add_argument("--syn-soft-tau", dest="syn_soft_tau", type=float, default=0.1,
                    help="τ: temperature for differentiable soft synthetic retrieval")
+    p.add_argument("--lambda-qa-mem", dest="lambda_qa_mem", type=float, default=1.0,
+                   help="Weight on the QA-loss term (qa_term) in L_mem's synthetic-memory "
+                        "update -- 0 ablates it, leaving only L_GM/L_align/L_reg to shape "
+                        "Theta_syn (\"w/o L_QA for graph\").")
     p.add_argument("--lambda-gm", dest="lambda_gm", type=float, default=0.1,
                    help="λ_gm: gradient-matching weight in L_mem (0 skips the extra "
                         "local-evidence forward pass per adaptation step)")
@@ -222,6 +243,33 @@ def _run_fl_train(argv: list[str]) -> int:
                    help="η_reg: server L_reg gradient step size after delta aggregation")
     p.add_argument("--server-reg-steps", dest="server_reg_steps", type=int, default=1,
                    help="Server-side L_reg gradient steps per round (fedrag mode)")
+    p.add_argument("--lambda-div", dest="lambda_div", type=float, default=0.1,
+                   help="λ_div: SERVER-side synthetic-node diversity weight -- used in "
+                        "Phase-I init aux loss (_repr_align_aux_loss) and in the Phase-II "
+                        "server L_reg refinement step (_server_reg_step). Distinct from "
+                        "--lambda-div-mem (client-side L_mem regularizer) -- do not confuse "
+                        "the two when ablating server-side regularization.")
+    p.add_argument("--lambda-deg", dest="lambda_deg", type=float, default=0.05,
+                   help="λ_deg: SERVER-side degree-regularization weight, paired with "
+                        "--lambda-div (see there). Distinct from --lambda-deg-mem.")
+    p.add_argument("--lambda-div-mem", dest="lambda_div_mem", type=float, default=0.1,
+                   help="λ_synDiv: CLIENT-side diversity weight inside L_mem's L_reg term "
+                        "(paper B.4.2, Stage E synthetic-memory adaptation) -- scaled by "
+                        "--lambda-reg-mem. Kept separate from --lambda-div (server-side) so "
+                        "disabling server-side regularization via --disable-server-reg never "
+                        "touches this client-side term.")
+    p.add_argument("--lambda-deg-mem", dest="lambda_deg_mem", type=float, default=0.05,
+                   help="λ_deg (client-side): see --lambda-div-mem.")
+    p.add_argument("--disable-server-reg", dest="disable_server_reg", action="store_true",
+                   help="Ablation switch isolating SERVER-side L_reg only (paper Phase I + "
+                        "Phase II synthetic-graph regularization). When set: (1) Phase-I "
+                        "init optimizes L_init = L_align only -- the diversity/degree aux "
+                        "terms in _repr_align_aux_loss are skipped entirely, not merely "
+                        "zero-weighted; (2) Phase-II's _apply_syn_deltas aggregates client "
+                        "synthetic-memory deltas as normal but SKIPS the subsequent server "
+                        "L_reg gradient step(s) entirely. Client-side losses (L_mem's L_QA/"
+                        "L_GM/L_align/L_reg, Stage-B L_cond) are completely unaffected -- see "
+                        "--lambda-div-mem/--lambda-deg-mem.")
     p.add_argument("--condense-refine-iters", dest="condense_refine_iters", type=int, default=1000,
                    help="Stage B refinement steps minimizing L_cond = L_ret(KL) + "
                         "λ_rep·L_rep + λ_div·L_div before uploading the anchor graph "
@@ -306,12 +354,59 @@ def _run_fl_train(argv: list[str]) -> int:
                    choices=["both", "dual", "evidence_only", "condensed_only",
                             "random_condensed", "none", "text_only", "shared", "no_synthetic"],
                    help="Graph soft-prompt mode. 'shared'=one shared GNN encoder; 'no_synthetic'=ignore server graph, both slots use evidence graph.")
+    p.add_argument("--route-eval-by-relevance", dest="route_eval_by_relevance",
+                   action="store_true", default=False,
+                   help="At eval, send each question to the client whose own top-5 evidence "
+                        "best matches it (max cosine on q_emb) instead of the default "
+                        "round-robin i %% num_clients. Opt-in: it changes WHICH client answers, "
+                        "not how clients share knowledge, so it is a retrieval-side effect "
+                        "rather than part of the federated mechanism.")
+    p.add_argument("--route-score-mode", dest="route_score_mode", default="hybrid",
+                   choices=["hybrid", "cosine"],
+                   help="Scoring used by --route-eval-by-relevance. 'hybrid' (default) = "
+                        "embedding cosine + lexical token overlap. 'cosine' = embedding "
+                        "similarity only (no lexical term) -- e.g. to reproduce a routed run "
+                        "from before the lexical term was added.")
+    p.add_argument("--query-expand-topk", dest="query_expand_topk", type=int, default=0,
+                   help="Rocchio-style query expansion: after the initial PPR retrieval, "
+                        "re-retrieve with 0.5*question + 0.5*mean(retrieved passages) over "
+                        "the client's FULL passage set (not just PPR-reachable candidates), "
+                        "and add this many extra passages. 0 = off. Targets multi-hop "
+                        "questions where the hop-2+ entity never appears in the question text, "
+                        "so single-shot PPR can never seed toward it -- measured oracle gain: "
+                        "musique 24.6%%->38.3%%, 2wikimultihop 61.7%%->66.6%%, hotpotqa 82.5%%->85.6%%. "
+                        "Set --merge-evidence-topk 0 to use query expansion alone on just the "
+                        "routed client. Requires --route-eval-by-relevance (it reuses that "
+                        "step's per-client relevance scores; without it this is a no-op).")
+    p.add_argument("--merge-evidence-topk", dest="merge_evidence_topk", type=int, default=0,
+                   help="Build the reader's `desc` from the top-N clients' passages instead of "
+                        "only the routed client's: this many passages FROM EACH client. 0 = off. "
+                        "Routing picks one client, which cannot serve a question whose hops live "
+                        "on different shards -- 73.4%% of hotpotqa's gold evidence spans 2+ "
+                        "clients. Requires --route-eval-by-relevance (the scores pick the order).")
+    p.add_argument("--merge-evidence-clients", dest="merge_evidence_clients", type=int, default=3,
+                   help="How many top-scoring clients contribute passages (default: all).")
+    p.add_argument("--graph-tokens-condensed", dest="graph_tokens_condensed", type=int, default=1,
+                   help="Soft-prompt tokens for the CONDENSED/synthetic graph slot (default 1 = "
+                        "the original single mean-pooled vector). This slot is the only channel "
+                        "carrying cross-client evidence -- `desc` is always local text and the "
+                        "condensed graph ships embeddings with no node_text -- yet 73.4%% of "
+                        "hotpotqa questions need another client's passages. Token 0 stays the "
+                        "mean-pool; the rest are the question's nearest nodes.")
+    p.add_argument("--graph-tokens-evidence", dest="graph_tokens_evidence", type=int, default=1,
+                   help="Soft-prompt tokens for the local evidence graph slot (default 1).")
+    p.add_argument("--metrics-path", dest="metrics_path", default="/tmp/fl_metrics.jsonl",
+                   help="Per-round metrics JSONL. The trainer TRUNCATES this on startup, so "
+                        "consecutive runs sharing the default clobber each other's results -- "
+                        "give each run its own path when sweeping.")
     p.add_argument("--wandb-run-name", dest="wandb_run_name", default=None,
                    help="WandB run display name. Auto-generated from dual_graph_mode if omitted.")
     p.add_argument("--wandb-tags", dest="wandb_tags", nargs="+", default=None,
                    help="WandB tags for filtering (e.g. --wandb-tags ablation shared).")
     p.add_argument("--wandb-group", dest="wandb_group", default=None,
                    help="WandB group name for grouping related runs.")
+    p.add_argument("--wandb-job-type", dest="wandb_job_type", default=None,
+                   help="WandB job_type, e.g. 'regularization-diversity-ablation'.")
     p.add_argument("--save-best", dest="save_best", action="store_true",
                    help="Save whatever this run actually trained -- the LoRA adapter "
                         "(--llm-frozen False) and/or the FedAvg'd graph_encoder/projector/"
@@ -324,6 +419,32 @@ def _run_fl_train(argv: list[str]) -> int:
                    help="Where to write the checkpoint from --save-best. Defaults to "
                         "checkpoints/<dataset>/<lora-agg-method>/best.pt when --save-best "
                         "is set without an explicit path.")
+    p.add_argument("--synthetic-snapshot-dir", dest="synthetic_snapshot_dir", default=None,
+                   help="If set, dump raw Theta_syn={X_syn,theta_PGE} snapshots here: "
+                        "synthetic_init.pt right after Phase-0 bootstrap (round 0) and "
+                        "synthetic_final.pt right after the last round. Independent of "
+                        "--save-best (which only fires on a new best val score). Used "
+                        "for offline privacy-leakage evaluation.")
+    p.add_argument("--experiment-dir", dest="experiment_dir", default=None,
+                   help="Root dir for the regularization-diversity ablation experiment "
+                        "(see docs on 'Effect of Regularization on Node Diversity'). When "
+                        "set: dumps Phase-I (every --syn-snapshot-every server updates, "
+                        "plus init/final) and Phase-II (every completed round) checkpoints "
+                        "of {X_syn, A_syn, node_type, matching repr_encoder/repr_projector "
+                        "state} under <experiment-dir>/<variant-name>/checkpoints/, computes "
+                        "X_syn/H_syn diversity diagnostics (mean off-diagonal cosine, "
+                        "entropy effective rank) at each checkpoint, logs them to WandB "
+                        "under explicit phase1/server_update, phase2/global_round, and "
+                        "checkpoint/index step axes, and writes a per-run "
+                        "diversity_checkpoints.jsonl + qa_summary.json for offline analysis "
+                        "(scripts/analyze_regularization_diversity.py).")
+    p.add_argument("--syn-snapshot-every", dest="syn_snapshot_every", type=int, default=10,
+                   help="Phase-I checkpoint cadence in server updates (only used when "
+                        "--experiment-dir is set). Snapshots are always also taken at "
+                        "update 0 (init) and the final Phase-I update.")
+    p.add_argument("--variant-name", dest="variant_name", default=None,
+                   help="Ablation arm label written into experiment checkpoints/manifest "
+                        "when --experiment-dir is set, e.g. 'with_reg' / 'without_reg'.")
     p.add_argument("--load-checkpoint", dest="load_checkpoint", default=None,
                    help="Load a --save-best checkpoint into the model before training/eval "
                         "-- whichever of LoRA / graph_encoder / projector / condensed_encoder"
@@ -338,6 +459,18 @@ def _run_fl_train(argv: list[str]) -> int:
                         "--dataset's test split. Pair with a --dataset preprocessed via "
                         "'main.py preprocess --qa-test-only' so its whole question set is "
                         "the test split, and --max-eval-samples set above that count.")
+    p.add_argument("--dump-predictions", dest="dump_predictions", default=None,
+                   help="Append per-question {id, client_id, pred, label} JSONL rows here "
+                        "during --eval-only, so F1 can be recomputed post-hoc split by any "
+                        "question subgroup (e.g. local-vs-cross-client evidence).")
+    p.add_argument("--freeze-loaded-lora", dest="freeze_loaded_lora", action="store_true",
+                   help="Use a --load-checkpoint'd LoRA adapter (e.g. a FlexLoRA/RoLoRA "
+                        "checkpoint) as a FROZEN base LLM instead of continuing to train it -- "
+                        "only graph_encoder/projector/condensed_encoder/projector_c train on "
+                        "top, same as grag/gretriever's --load_checkpoint (\"reuse a fedrag "
+                        "LoRA as frozen backbone\"). Requires --llm-frozen False (to build the "
+                        "LoRA adapter structure the checkpoint loads into) + a matching "
+                        "--lora-rank/--lora-alpha/--lora-target-modules.")
     p.add_argument("--top-r-passages", dest="top_r_passages", type=int, default=0,
                    help="If >0, re-rank each record's retrieved_passages by q_emb similarity "
                         "and keep the top-r as 'desc'. Also exposes anchor_passage_nodes for "
