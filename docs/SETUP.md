@@ -26,6 +26,15 @@ conda activate fedrag
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 pip install torch_geometric torch_scatter
 pip install -r requirements.txt
+
+# transformers kéo theo torchvision/torchaudio làm optional deps cho các loss
+# multimodal/audio mà repo này không dùng -- bản pip tự chọn cho chúng THƯỜNG
+# không khớp ABI với bản torch đã pin ở trên, gây lỗi kiểu
+# "operator torchvision::nms does not exist" hoặc
+# "undefined symbol: torch_library_impl" ngay khi import sentence_transformers/
+# transformers (dù ở một máy khác có thể không bị, tuỳ bản pip resolve ra).
+# Gỡ luôn cho chắc -- transformers tự fallback về không có chúng:
+python -m pip uninstall -y torchvision torchaudio
 ```
 
 Model LLM tự tải từ HuggingFace ở lần chạy đầu (Qwen2.5-1.5B-Instruct ~3GB,
