@@ -11,9 +11,24 @@ from peft import (
     prepare_model_for_kbit_training,
 )
 
+# Upstream GRAG's Llama-2 chat markers. Kept as the Llama-family fallback,
+# but NOT used unconditionally any more -- see the NOTE below.
 BOS = '<s>[INST]'
 EOS_USER = '[/INST]'
 EOS = '</s>'
+
+# NOTE (fedrag fork): upstream hardcodes the three markers above for every
+# backbone. Fed to a Qwen tokenizer they are just literal text, and the damage
+# is not cosmetic: `EOS` is appended to every training label, so with a frozen
+# LLM the model is taught to emit the *string* "</s>" rather than to stop. It
+# then runs to max_new_tokens on every question. Measured effect with
+# Qwen2.5-7B-Instruct + a fedrag LoRA: hit ~28% (the answer is in there) but
+# EM ~0 and F1 ~12% (buried in filler), against val_em 22-28 for the same
+# checkpoint under fedrag's own prompt. "</s>" is also not a Qwen special
+# token, so skip_special_tokens=True leaves it in the decoded prediction.
+# Resolve the markers from the tokenizer instead, exactly as this project's
+# own fedcond_grag/model/graph_llm.py does.
+from fedcond_grag.model.graph_llm import resolve_prompt_template  # noqa: E402
 
 IGNORE_INDEX = -100
 
@@ -50,6 +65,11 @@ class GraphLLM(torch.nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(args.llm_model_path, use_fast=False, revision=kwargs["revision"])
         self.tokenizer.pad_token_id = 0
         self.tokenizer.padding_side = 'left'
+        # Markers native to this backbone (ChatML for Qwen-Instruct, the
+        # Llama constants above for Llama) -- see the NOTE at module scope.
+        self.bos_text, self.eos_user_text, self.eos_text = resolve_prompt_template(self.tokenizer)
+        print(f"    [grag] prompt template: bos={self.bos_text!r} "
+              f"eos_user={self.eos_user_text!r} eos={self.eos_text!r}", flush=True)
 
         # NOTE (fedrag fork): the cuDNN SDPA backend (newer torch versions)
         # throws "No execution plans support the graph" on some GPU/cuDNN
@@ -84,6 +104,17 @@ class GraphLLM(torch.nn.Module):
             _dtype = torch.float16
         else:
             _dtype = torch.bfloat16
+        # device_map is what actually keeps host RAM down. low_cpu_mem_usage
+        # alone only avoids double-allocating: the shards still materialise in
+        # host RAM and are moved to the GPU afterwards, which peaked at 15.2GB
+        # RSS on a 15GB box and got the process OOM-killed by the kernel
+        # (dmesg: "Out of memory: Killed process ... anon-rss:15205808kB").
+        # With a device_map, accelerate + bitsandbytes place and quantise each
+        # shard straight onto the GPU, so host RAM never holds the whole model.
+        # fedcond_grag/model/graph_llm.py already does this; the vendored copy
+        # did not, which is why gretriever survived the same load and grag did not.
+        if torch.cuda.is_available():
+            kwargs.setdefault("device_map", {"": torch.cuda.current_device()})
         model = AutoModelForCausalLM.from_pretrained(
             args.llm_model_path,
             torch_dtype=_dtype,
@@ -92,6 +123,17 @@ class GraphLLM(torch.nn.Module):
             attn_implementation="sdpa",
             **kwargs
         )
+
+        # Optional activation-memory saving during training. GRAG only trains
+        # graph_encoder/projector, but gradients still flow back through the
+        # frozen LLM, so its activations dominate GPU memory. use_reentrant=False
+        # is required here: the reentrant variant crashes when only some inputs
+        # require grad, which is exactly this setup (see commit "Fix
+        # reentrant-checkpointing crash in FedRAG LoRA runs").
+        if bool(getattr(args, "llm_gradient_checkpointing", False)):
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            model.enable_input_require_grads()
+            print("    [grag] gradient checkpointing enabled (use_reentrant=False)", flush=True)
 
         if args.llm_frozen == 'True':
             print("Freezing LLAMA!")
@@ -179,9 +221,9 @@ class GraphLLM(torch.nn.Module):
         labels = self.tokenizer(samples["label"], add_special_tokens=False)
 
         # encode special tokens
-        eos_tokens = self.tokenizer(EOS, add_special_tokens=False)
-        eos_user_tokens = self.tokenizer(EOS_USER, add_special_tokens=False)
-        bos_embeds = self.word_embedding(self.tokenizer(BOS, add_special_tokens=False, return_tensors='pt').input_ids[0].to(self.model.device))
+        eos_tokens = self.tokenizer(self.eos_text, add_special_tokens=False)
+        eos_user_tokens = self.tokenizer(self.eos_user_text, add_special_tokens=False)
+        bos_embeds = self.word_embedding(self.tokenizer(self.bos_text, add_special_tokens=False, return_tensors='pt').input_ids[0].to(self.model.device))
         pad_embeds = self.word_embedding(torch.tensor(self.tokenizer.pad_token_id).to(self.model.device)).unsqueeze(0)
 
         # encode graphs
@@ -235,8 +277,8 @@ class GraphLLM(torch.nn.Module):
         descriptions = self.tokenizer(samples["desc"], add_special_tokens=False)
 
         # encode special tokens
-        eos_user_tokens = self.tokenizer(EOS_USER, add_special_tokens=False)
-        bos_embeds = self.word_embedding(self.tokenizer(BOS, add_special_tokens=False, return_tensors='pt').input_ids[0].to(self.model.device))
+        eos_user_tokens = self.tokenizer(self.eos_user_text, add_special_tokens=False)
+        bos_embeds = self.word_embedding(self.tokenizer(self.bos_text, add_special_tokens=False, return_tensors='pt').input_ids[0].to(self.model.device))
         pad_embeds = self.word_embedding(torch.tensor(self.tokenizer.pad_token_id).to(self.model.device)).unsqueeze(0)
 
         # encode graphs
@@ -269,7 +311,11 @@ class GraphLLM(torch.nn.Module):
                 inputs_embeds=inputs_embeds,
                 max_new_tokens=self.max_new_tokens,
                 attention_mask=attention_mask,
-                # do_sample=True,
+                # Upstream left this commented out, which does NOT mean greedy:
+                # generate() then falls back to the model's generation_config,
+                # and Qwen2.5-Instruct ships do_sample=true/temperature=0.7, so
+                # eval silently sampled. Set it explicitly for reproducibility.
+                do_sample=False,
                 use_cache=True  # IMPORTANT!
             )
         pred = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)

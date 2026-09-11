@@ -431,6 +431,14 @@ class GraphLLM(torch.nn.Module):
                 attention_mask=attention_mask,
                 pad_token_id=self.tokenizer.pad_token_id,
                 use_cache=True,
+                # Without this, generate() falls back to the model's own
+                # generation_config -- Qwen2.5-Instruct ships do_sample=true,
+                # temperature=0.7, top_p=0.8 -- so evaluation was sampling.
+                # Scoring the identical 200 questions twice then gave different
+                # numbers (val_em 23.50 vs test_em 27.00 on the same list
+                # object), i.e. every reported EM carried +-3 points of decode
+                # noise. Greedy makes eval reproducible.
+                do_sample=False,
             )
         pred = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 

@@ -46,13 +46,27 @@ DATASET_NAMES = {
 }
 
 
+def _base_dataset_name(dataset: str) -> str:
+    """Strip a partition-variant suffix (e.g. 'hotpotqa__dirichlet_0.1' ->
+    'hotpotqa') so raw-corpus/question lookups keyed by DATASET_NAMES still
+    resolve -- the questions/gold answers are the same regardless of which
+    client-corpus partition is in use."""
+    return dataset.split("__", 1)[0]
+
+
 def _load_client_chunks(dataset: str, client_id: int, num_clients: int) -> list[str]:
+    # A prebuilt partition (e.g. a Dirichlet client-skew variant) takes
+    # precedence over the legacy iid `index % num_clients` split below --
+    # see `main.py preprocess --partition-mode` / topic_partition.py.
+    partition_path = _ROOT / "processed" / dataset / f"client_{client_id}" / "chunks.json"
+    if partition_path.exists():
+        return json.loads(partition_path.read_text(encoding="utf-8"))
     chunks = json.loads((LINEARRAG_DIR / dataset / "chunks.json").read_text(encoding="utf-8"))
     return [c for i, c in enumerate(chunks) if i % num_clients == client_id]
 
 
 def _load_global_samples(dataset: str) -> list[dict]:
-    raw_name = DATASET_NAMES[dataset]
+    raw_name = DATASET_NAMES[_base_dataset_name(dataset)]
     return json.loads((RAW_DIR / f"{raw_name}.json").read_text(encoding="utf-8"))
 
 
@@ -78,9 +92,14 @@ def run_client_baseline(
     retrieval_top_k: int = 5,
     max_eval_samples: int = 200,
     save_root: Path | str = DEFAULT_SAVE_ROOT,
+    dump_predictions_path: str | None = None,
 ) -> dict[str, Any]:
     """Index client `client_id`'s local chunk shard with LinearRAG and
-    evaluate it against the full global question set for `dataset`."""
+    evaluate it against the full global question set for `dataset`.
+
+    If `dump_predictions_path` is given, appends one JSONL row per question
+    ({"id", "client_id", "pred", "label"}) -- so F1 can be recomputed
+    post-hoc split by subgroup (e.g. local-vs-cross-client gold evidence)."""
     # LLM_Model (baselines/linearrag/utils.py) reads these env vars -- same
     # OpenAI-compatible-endpoint convention as the other baselines.
     os.environ["OPENAI_BASE_URL"] = llm_base_url
@@ -107,14 +126,24 @@ def run_client_baseline(
                  for s, a in zip(samples, gold_answers)]
     qa_results = rag.qa(questions)
 
+    dump_f = open(dump_predictions_path, "a") if dump_predictions_path else None
     hits = em_total = f1_total = 0.0
-    for result, answers in zip(qa_results, gold_answers):
-        pred = result.get("pred_answer", "")
-        if any(normalize(a) in normalize(pred) for a in answers):
-            hits += 1
-        if any(exact_match(pred, a) for a in answers):
-            em_total += 1.0
-        f1_total += max((token_f1(pred, a) for a in answers), default=0.0)
+    try:
+        for sample, result, answers in zip(samples, qa_results, gold_answers):
+            pred = result.get("pred_answer", "")
+            if any(normalize(a) in normalize(pred) for a in answers):
+                hits += 1
+            if any(exact_match(pred, a) for a in answers):
+                em_total += 1.0
+            f1_total += max((token_f1(pred, a) for a in answers), default=0.0)
+            if dump_f is not None:
+                dump_f.write(json.dumps({
+                    "id": str(sample.get("_id", sample.get("id"))), "client_id": client_id,
+                    "pred": pred, "label": "|".join(answers),
+                }) + "\n")
+    finally:
+        if dump_f is not None:
+            dump_f.close()
 
     n = max(len(samples), 1)
     return {
@@ -129,11 +158,15 @@ def run_client_baseline(
     }
 
 
-def run_all_clients(dataset: str, num_clients: int, save_root: Path | str = DEFAULT_SAVE_ROOT, **kwargs: Any) -> dict[str, Any]:
+def run_all_clients(dataset: str, num_clients: int, save_root: Path | str = DEFAULT_SAVE_ROOT,
+                     dump_predictions_path: str | None = None, **kwargs: Any) -> dict[str, Any]:
     """Run every client's local LinearRAG baseline independently and write a
     summary JSON (per-client metrics + mean across clients)."""
+    if dump_predictions_path:
+        Path(dump_predictions_path).write_text("")   # reset on new run
     per_client = [
-        run_client_baseline(dataset, client_id, num_clients, save_root=save_root, **kwargs)
+        run_client_baseline(dataset, client_id, num_clients, save_root=save_root,
+                             dump_predictions_path=dump_predictions_path, **kwargs)
         for client_id in range(num_clients)
     ]
 

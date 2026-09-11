@@ -36,7 +36,10 @@ from fedcond_grag.baselines.wandb_logging import log_baseline_result
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset", required=True, choices=["hotpotqa", "musique", "2wikimultihop", "medical"])
+    parser.add_argument("--dataset", required=True, choices=[
+        "hotpotqa", "musique", "2wikimultihop", "medical",
+        "hotpotqa__dirichlet_0.1", "musique__dirichlet_0.1", "2wikimultihop__dirichlet_0.1",
+    ])
     parser.add_argument("--num_clients", type=int, default=3)
     parser.add_argument("--client", type=int, default=None,
                          help="Run only this client id (0-indexed). Default: run all clients.")
@@ -73,6 +76,21 @@ def main() -> None:
                               "[q_proj, v_proj]), i.e. a run that didn't override --lora-rank/--lora-alpha/"
                               "--lora-target-modules. Since grag/gretriever only ever train graph_encoder/"
                               "projector (never the LLM), this LoRA stays frozen throughout.")
+    parser.add_argument("--openie_llm_name", default="",
+                         help="Which HippoRAG OpenIE cache to build the graph from, by model id "
+                              "(e.g. fedrag-rolora -> openie_results_ner_fedrag-rolora.json). "
+                              "That directory holds one cache per model that has been run, and "
+                              "without this the loader just took whichever the filesystem listed "
+                              "first -- which silently picked a triple-free cache.")
+    parser.add_argument("--llm_gradient_checkpointing", action="store_true",
+                         help="Enable gradient checkpointing on the frozen LLM to cut GPU activation "
+                              "memory during local training (slower per step).")
+    parser.add_argument("--save_root", default="",
+                         help="Where to write summary.json. Defaults to output/baselines/grag; "
+                              "point it elsewhere (e.g. output/baselines_lora/grag) to keep a "
+                              "run from overwriting an earlier one's results.")
+    parser.add_argument("--dump_predictions", default=None,
+                         help="Append per-question {id, client_id, pred, label} JSONL rows here.")
     args = parser.parse_args()
 
     device = "cuda" if args.use_cuda and torch.cuda.is_available() else "cpu"
@@ -94,6 +112,9 @@ def main() -> None:
         qa_data_root=args.qa_data_root,
         qa_train_root=args.qa_train_root,
         load_checkpoint=args.load_checkpoint,
+        openie_llm_name=args.openie_llm_name,
+        llm_gradient_checkpointing=args.llm_gradient_checkpointing,
+        dump_predictions_path=args.dump_predictions,
     )
 
     if args.client is not None:
@@ -101,6 +122,8 @@ def main() -> None:
         print(json.dumps(result, indent=2))
         log_baseline_result("grag", args.dataset, result)
     else:
+        if args.save_root:
+            common_kwargs["save_root"] = args.save_root
         summary = run_all_clients(args.dataset, args.num_clients, **common_kwargs)
         print(f"\n=== {args.dataset}: mean over {args.num_clients} clients ===")
         print(json.dumps(summary["mean"], indent=2))

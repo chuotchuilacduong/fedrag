@@ -47,6 +47,7 @@ training, for a fair baseline comparison.
 
 from __future__ import annotations
 
+import gc
 import glob
 import json
 import os
@@ -112,6 +113,14 @@ DEFAULT_ARGS: dict[str, Any] = dict(
     # backbone before training -- see fedcond_grag/baselines/checkpoint_utils.py.
     # Requires llm_frozen=False (adds the LoRA structure to load into).
     load_checkpoint="",
+    # Which HippoRAG OpenIE cache to build the graph from; see _find_hippo_openie.
+    openie_llm_name="",
+    # Trade compute for GPU activation memory during local training.
+    llm_gradient_checkpointing=False,
+    # Append per-question {id, client_id, pred, label} JSONL rows (test split
+    # only) here -- so F1 can be recomputed post-hoc split by subgroup (e.g.
+    # local-vs-cross-client gold evidence).
+    dump_predictions_path="",
 )
 
 
@@ -119,12 +128,35 @@ def _build_args(overrides: dict[str, Any]) -> Namespace:
     return Namespace(**{**DEFAULT_ARGS, **overrides})
 
 
-def _find_hippo_openie(dataset: str, client_id: int) -> dict | None:
-    pattern = str(HIPPO_OPENIE_ROOT / dataset / f"client_{client_id}" / "openie_results_ner_*.json")
-    matches = glob.glob(pattern)
+def _find_hippo_openie(dataset: str, client_id: int, openie_llm_name: str = "") -> dict | None:
+    """Load the HippoRAG OpenIE cache for this client.
+
+    `openie_llm_name` picks the exact file. It matters: that directory now
+    holds one cache per model that has been run (plus .pre_proprag backups),
+    and the original `glob(...)[0]` took whichever the filesystem listed first.
+    That silently loaded a different model's extraction -- in one run it picked
+    a triple-free cache while the intended one held 207k triples, and the only
+    visible symptom was num_nodes coming out identical to a previous run.
+    """
+    client_dir = HIPPO_OPENIE_ROOT / dataset / f"client_{client_id}"
+    if openie_llm_name:
+        exact = client_dir / f"openie_results_ner_{openie_llm_name}.json"
+        if not exact.exists():
+            raise FileNotFoundError(
+                f"No OpenIE cache for openie_llm_name={openie_llm_name!r} at {exact}. "
+                f"Available: {sorted(p.name for p in client_dir.glob('openie_results_ner_*.json'))}"
+            )
+        return json.loads(exact.read_text(encoding="utf-8"))
+
+    # No name given: stay deterministic and never pick a .pre_proprag backup.
+    matches = sorted(p for p in client_dir.glob("openie_results_ner_*.json")
+                     if not p.name.endswith(".pre_proprag.json"))
     if not matches:
         return None
-    return json.loads(Path(matches[0]).read_text(encoding="utf-8"))
+    if len(matches) > 1:
+        print(f"    [grag] WARNING: {len(matches)} OpenIE caches in {client_dir}; "
+              f"using {matches[0].name}. Pass --openie_llm_name to choose explicitly.", flush=True)
+    return json.loads(matches[0].read_text(encoding="utf-8"))
 
 
 def _build_graph_from_openie(openie: dict, encoder) -> tuple[Data, pd.DataFrame, pd.DataFrame]:
@@ -197,8 +229,8 @@ def _finalize_graph(
     return graph, nodes_df, edges_df
 
 
-def _load_client_graph(dataset: str, client_id: int, num_clients: int, encoder) -> tuple[Data, pd.DataFrame, pd.DataFrame, str]:
-    openie = _find_hippo_openie(dataset, client_id)
+def _load_client_graph(dataset: str, client_id: int, num_clients: int, encoder, openie_llm_name: str = "") -> tuple[Data, pd.DataFrame, pd.DataFrame, str]:
+    openie = _find_hippo_openie(dataset, client_id, openie_llm_name)
     if openie is not None:
         graph, nodes_df, edges_df = _build_graph_from_openie(openie, encoder)
         return graph, nodes_df, edges_df, "hipporag_openie"
@@ -233,24 +265,31 @@ def _retrieve_sample(graph: Data, nodes_df: pd.DataFrame, edges_df: pd.DataFrame
     return subgraph, desc
 
 
-def _eval_split(model: GraphLLM, samples: list[dict], args: Namespace) -> dict[str, float]:
-    if not samples:
+def _eval_split(model: GraphLLM, batches, n: int, args: Namespace,
+                 client_id: int = 0, dump_predictions_path: str | None = None) -> dict[str, float]:
+    if not n:
         return {"hit": 0.0, "em": 0.0, "f1": 0.0}
-    batch_size = int(args.eval_batch_size)
     hits = em_total = f1_total = 0.0
     model.eval()
-    with torch.no_grad():
-        for i in range(0, len(samples), batch_size):
-            mini = samples[i : i + batch_size]
-            batch = grag_collate_fn(mini)
-            out = model.inference(batch)
-            for pred, label in zip(out["pred"], out["label"]):
-                if normalize(label) in normalize(pred):
-                    hits += 1
-                if exact_match(pred, label):
-                    em_total += 1.0
-                f1_total += token_f1(pred, label)
-    n = len(samples)
+    dump_f = open(dump_predictions_path, "a") if dump_predictions_path else None
+    try:
+        with torch.no_grad():
+            for batch in batches:
+                out = model.inference(batch)
+                ids = batch.get("id", [None] * len(out["pred"]))
+                for qid, pred, label in zip(ids, out["pred"], out["label"]):
+                    if normalize(label) in normalize(pred):
+                        hits += 1
+                    if exact_match(pred, label):
+                        em_total += 1.0
+                    f1_total += token_f1(pred, label)
+                    if dump_f is not None:
+                        dump_f.write(json.dumps({
+                            "id": qid, "client_id": client_id, "pred": pred, "label": label,
+                        }) + "\n")
+    finally:
+        if dump_f is not None:
+            dump_f.close()
     return {"hit": 100.0 * hits / n, "em": 100.0 * em_total / n, "f1": 100.0 * f1_total / n}
 
 
@@ -270,7 +309,8 @@ def run_client_baseline(
     args = _build_args(arg_overrides)
 
     encoder = load_encoder(DEFAULT_MODEL)
-    graph, nodes_df, edges_df, graph_source = _load_client_graph(dataset, client_id, num_clients, encoder)
+    graph, nodes_df, edges_df, graph_source = _load_client_graph(
+        dataset, client_id, num_clients, encoder, getattr(args, "openie_llm_name", ""))
 
     qa_dataset = FedCondQADataset(root=args.qa_data_root)
     idx_split = qa_dataset.get_idx_split()
@@ -296,28 +336,38 @@ def run_client_baseline(
         val_idx = idx_split["val"][:max_eval]
         test_idx = idx_split["test"][:max_eval]
 
-    def _prepare(idx_list, source_dataset) -> list[dict]:
-        prepared = []
-        for i in idx_list:
-            row = source_dataset[i]
-            # Prefer the dataset's own precomputed embedding (raw question
-            # text, all-MiniLM-L6-v2, built by scripts/build_fedcond_qa_dataset.py)
-            # over re-embedding row["question"], which is already wrapped in
-            # the "Question: ...\nAnswer: " prompt template.
-            if "q_emb" in row:
-                q_emb = row["q_emb"].float()
-            else:
-                q_emb = encoder.encode(
-                    [row["question"]], convert_to_tensor=True, normalize_embeddings=True, show_progress_bar=False,
-                ).float().cpu()[0]
-            subgraph, desc = _retrieve_sample(graph, nodes_df, edges_df, q_emb, args)
-            prepared.append({"id": row["id"], "question": row["question"], "label": row["label"],
-                              "desc": desc, "graph": subgraph})
-        return prepared
+    def _prepare_one(i, source_dataset) -> dict:
+        row = source_dataset[i]
+        # Prefer the dataset's own precomputed embedding (raw question
+        # text, all-MiniLM-L6-v2, built by scripts/build_fedcond_qa_dataset.py)
+        # over re-embedding row["question"], which is already wrapped in
+        # the "Question: ...\nAnswer: " prompt template.
+        if "q_emb" in row:
+            q_emb = row["q_emb"].float()
+        else:
+            q_emb = encoder.encode(
+                [row["question"]], convert_to_tensor=True, normalize_embeddings=True, show_progress_bar=False,
+            ).float().cpu()[0]
+        subgraph, desc = _retrieve_sample(graph, nodes_df, edges_df, q_emb, args)
+        return {"id": row["id"], "question": row["question"], "label": row["label"],
+                "desc": desc, "graph": subgraph}
 
-    train_samples = _prepare(train_idx, train_qa_dataset)
-    val_samples = _prepare(val_idx, qa_dataset)
-    test_samples = _prepare(test_idx, qa_dataset)
+    def _iter_batches(idx_list, source_dataset, batch_size: int):
+        """Retrieve and collate one mini-batch at a time.
+
+        Materialising every sample up front (the previous behaviour) is not
+        survivable on this graph. A 2-hop ego subgraph over the
+        PropRAG-derived KG averages ~2.4k nodes / ~16.7k edges, i.e. ~29MB
+        of x/edge_attr per question -- so holding 1267 of them wants ~37GB
+        of host RAM on a 15GB box, and the process gets to ~13GB and takes
+        WSL down with it. Retrieval is only ~183ms/sample, so re-running it
+        each epoch costs ~7min/client, which is noise next to 7B generation
+        over 1000 questions. Peak memory becomes batch_size x 29MB instead.
+        """
+        for i in range(0, len(idx_list), batch_size):
+            chunk = idx_list[i : i + batch_size]
+            if chunk:
+                yield grag_collate_fn([_prepare_one(j, source_dataset) for j in chunk])
 
     llm_path = args.llm_model_path or llama_model_path.get(args.llm_model_name, "")
     if not llm_path:
@@ -337,24 +387,32 @@ def run_client_baseline(
     optimizer = torch.optim.AdamW(trainable, lr=args.local_lr, weight_decay=args.local_wd, betas=(0.9, 0.95))
 
     batch_size = int(args.local_batch_size)
+    eval_bs = int(args.eval_batch_size)
     total_loss, total_steps = 0.0, 0
-    for _ in range(int(args.local_epochs)):
+    for epoch in range(int(args.local_epochs)):
         model.train()
-        for i in range(0, len(train_samples), batch_size):
-            mini = train_samples[i : i + batch_size]
-            if not mini:
-                continue
-            batch = grag_collate_fn(mini)
+        for batch in _iter_batches(train_idx, train_qa_dataset, batch_size):
             optimizer.zero_grad()
             loss = model(batch)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
             total_steps += 1
+        print(f"    [grag] client {client_id} epoch {epoch + 1}/{args.local_epochs} "
+              f"loss={total_loss / max(total_steps, 1):.4f}", flush=True)
     avg_train_loss = total_loss / total_steps if total_steps else None
 
-    val_metrics = _eval_split(model, val_samples, args)
-    test_metrics = _eval_split(model, test_samples, args)
+    print(f"    [grag] client {client_id} evaluating {len(test_idx)} test questions", flush=True)
+    test_metrics = _eval_split(model, _iter_batches(test_idx, qa_dataset, eval_bs), len(test_idx), args,
+                                client_id=client_id, dump_predictions_path=(args.dump_predictions_path or None))
+    if val_idx == test_idx:
+        # The qa_train_root path sets val_idx = test_idx = the same held-out
+        # test split, so evaluating both ran 1000 identical 7B generations
+        # twice per client for byte-identical numbers. Reuse the result.
+        val_metrics = test_metrics
+    else:
+        print(f"    [grag] client {client_id} evaluating {len(val_idx)} val questions", flush=True)
+        val_metrics = _eval_split(model, _iter_batches(val_idx, qa_dataset, eval_bs), len(val_idx), args)
 
     return {
         "dataset": dataset,
@@ -362,8 +420,8 @@ def run_client_baseline(
         "num_clients": num_clients,
         "graph_source": graph_source,
         "num_nodes": int(graph.num_nodes),
-        "num_train_samples": len(train_samples),
-        "num_questions": len(val_samples) + len(test_samples),
+        "num_train_samples": len(train_idx),
+        "num_questions": len(val_idx) + len(test_idx),
         "train_loss": avg_train_loss,
         "val_hit": val_metrics["hit"], "val_em": val_metrics["em"], "val_f1": val_metrics["f1"],
         "test_hit": test_metrics["hit"], "test_em": test_metrics["em"], "test_f1": test_metrics["f1"],
@@ -373,10 +431,21 @@ def run_client_baseline(
 def run_all_clients(dataset: str, num_clients: int, save_root: Path | str = DEFAULT_SAVE_ROOT, **kwargs: Any) -> dict[str, Any]:
     """Run every client's local GRAG baseline independently and write a
     summary JSON (per-client metrics + mean across clients)."""
-    per_client = [
-        run_client_baseline(dataset, client_id, num_clients, **kwargs)
-        for client_id in range(num_clients)
-    ]
+    dump_path = kwargs.get("dump_predictions_path")
+    if dump_path:
+        Path(dump_path).write_text("")   # reset on new run
+    per_client = []
+    for client_id in range(num_clients):
+        per_client.append(run_client_baseline(dataset, client_id, num_clients, **kwargs))
+        # Hand the finished client's VRAM back before the next one builds its
+        # own 7B. Dropping the last reference is not enough: the caching
+        # allocator keeps those blocks reserved, so client N+1 allocates fresh
+        # and the two briefly coexist. On a 16GB card that transient measured
+        # 15975MiB where steady-state training sat at 15072, and musique died
+        # there with `CUDA driver error: out of memory` inside the GAT conv.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     metric_keys = sorted({k for r in per_client for k, v in r.items() if isinstance(v, (int, float))})
     mean_metrics = {

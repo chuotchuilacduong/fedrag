@@ -22,7 +22,15 @@ _log = logging.getLogger("dgrag.extract")
 _VALID_TYPES = {"person", "place", "event", "object", "organization", "category", "concept"}
 
 
-def _parse_entity(raw: dict) -> Optional[Entity]:
+def _parse_entity(raw) -> Optional[Entity]:
+    # This model doesn't always follow the {entity_name, entity_type,
+    # entity_description} schema -- it sometimes emits a bare entity-name
+    # string instead. Treat that as a minimal entity rather than dropping
+    # the whole chunk's extraction on .get().
+    if isinstance(raw, str):
+        raw = {"entity_name": raw}
+    elif not isinstance(raw, dict):
+        return None
     name = (raw.get("entity_name") or raw.get("name") or "").strip()
     if not name:
         return None
@@ -33,7 +41,9 @@ def _parse_entity(raw: dict) -> Optional[Entity]:
     )
 
 
-def _parse_relation(raw: dict) -> Optional[Relation]:
+def _parse_relation(raw) -> Optional[Relation]:
+    if not isinstance(raw, dict):
+        return None
     src = (raw.get("source_entity") or raw.get("source") or "").strip()
     tgt = (raw.get("target_entity") or raw.get("target") or "").strip()
     if not src or not tgt:
@@ -73,6 +83,18 @@ def _merge_relation(store: dict[tuple[str, str], Relation], relation: Relation, 
         store[key] = relation
 
 
+def _as_dict(raw) -> dict:
+    # infer_json can hand back a non-dict JSON value (bare list, string) when
+    # the model doesn't wrap its output in the expected {"entities": [...],
+    # "relations": [...]} object -- treat anything else as empty rather than
+    # crash the whole chunk.
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, list):
+        return {"entities": raw}
+    return {}
+
+
 def extract_chunk(
     chunk: Chunk,
     slm: DGRAGModel,
@@ -82,7 +104,7 @@ def extract_chunk(
 ) -> None:
     """Extract entities + relations from one chunk, merging into stores."""
     prompt = build_extract_prompt(chunk.text)
-    raw = slm.infer_json(prompt, temperature=0.0, default={})
+    raw = _as_dict(slm.infer_json(prompt, temperature=0.0, default={}))
     prior_text = str(raw)
 
     for e_raw in raw.get("entities", []):
@@ -97,7 +119,7 @@ def extract_chunk(
     # Gleaning: ask SLM for missed items
     for _ in range(glean_rounds):
         prompt2 = build_extract_continue_prompt(chunk.text, prior_text)
-        raw2 = slm.infer_json(prompt2, temperature=0.0, default={})
+        raw2 = _as_dict(slm.infer_json(prompt2, temperature=0.0, default={}))
         if not raw2:
             break
         for e_raw in raw2.get("entities", []):

@@ -44,6 +44,7 @@ fedrag's own training, for a fair baseline comparison.
 
 from __future__ import annotations
 
+import gc
 import json
 from argparse import Namespace
 from pathlib import Path
@@ -90,6 +91,10 @@ DEFAULT_ARGS: dict[str, Any] = dict(
     max_train_samples=0,   # 0 = use this client's full train shard
     top_r_passages=0,
     top_r_anchor=None,
+    # Append per-question {id, client_id, pred, label} JSONL rows (test split
+    # only) here -- so F1 can be recomputed post-hoc split by subgroup (e.g.
+    # local-vs-cross-client gold evidence).
+    dump_predictions_path="",
 )
 
 
@@ -138,7 +143,8 @@ def _load_model(args: Namespace, device: torch.device):
     return model
 
 
-def _eval_client(client, model, samples: list, args: Namespace) -> dict[str, float]:
+def _eval_client(client, model, samples: list, args: Namespace,
+                  client_id: int = 0, dump_predictions_path: str | None = None) -> dict[str, float]:
     from fedcond_grag.utils.collate import collate_fn
     from fedcond_grag.utils.evaluate import exact_match, normalize, token_f1
 
@@ -149,18 +155,28 @@ def _eval_client(client, model, samples: list, args: Namespace) -> dict[str, flo
     hits = em_total = 0.0
     f1_total = 0.0
     model.eval()
-    with torch.no_grad():
-        shard = client._attach_evidence_graphs(list(samples))
-        for i in range(0, len(shard), batch_size):
-            mini = shard[i : i + batch_size]
-            batch = collate_fn(mini)
-            out = model.inference(batch)
-            for pred, label in zip(out["pred"], out["label"]):
-                if normalize(label) in normalize(pred):
-                    hits += 1
-                if exact_match(pred, label):
-                    em_total += 1.0
-                f1_total += token_f1(pred, label)
+    dump_f = open(dump_predictions_path, "a") if dump_predictions_path else None
+    try:
+        with torch.no_grad():
+            shard = client._attach_evidence_graphs(list(samples))
+            for i in range(0, len(shard), batch_size):
+                mini = shard[i : i + batch_size]
+                batch = collate_fn(mini)
+                out = model.inference(batch)
+                ids = batch.get("id", [None] * len(out["pred"]))
+                for qid, pred, label in zip(ids, out["pred"], out["label"]):
+                    if normalize(label) in normalize(pred):
+                        hits += 1
+                    if exact_match(pred, label):
+                        em_total += 1.0
+                    f1_total += token_f1(pred, label)
+                    if dump_f is not None:
+                        dump_f.write(json.dumps({
+                            "id": qid, "client_id": client_id, "pred": pred, "label": label,
+                        }) + "\n")
+    finally:
+        if dump_f is not None:
+            dump_f.close()
 
     n = len(samples)
     return {"hit": 100.0 * hits / n, "em": 100.0 * em_total / n, "f1": 100.0 * f1_total / n}
@@ -237,8 +253,16 @@ def run_client_baseline(
 
     # eval_client shares the just-trained model (weights transfer directly;
     # only the graph/evidence-retrieval context can differ from train_client).
-    val_metrics = _eval_client(eval_client, model, val_samples, args)
-    test_metrics = _eval_client(eval_client, model, test_samples, args)
+    test_metrics = _eval_client(eval_client, model, test_samples, args,
+                                 client_id=client_id, dump_predictions_path=(args.dump_predictions_path or None))
+    if val_samples is test_samples:
+        # The qa_train_root path binds both names to the SAME list (the held-out
+        # test split), so evaluating each ran 2x max_eval generations per client
+        # for byte-identical numbers. At max_eval=1000 that is 1000 wasted 7B
+        # generations per client.
+        val_metrics = test_metrics
+    else:
+        val_metrics = _eval_client(eval_client, model, val_samples, args)
 
     return {
         "dataset": dataset,
@@ -261,10 +285,20 @@ def run_all_clients(
 ) -> dict[str, Any]:
     """Run every client's local G-Retriever baseline independently and write
     a summary JSON (per-client metrics + mean across clients)."""
-    per_client = [
-        run_client_baseline(dataset, client_id, num_clients, **kwargs)
-        for client_id in range(num_clients)
-    ]
+    dump_path = kwargs.get("dump_predictions_path")
+    if dump_path:
+        Path(dump_path).write_text("")   # reset on new run
+    per_client = []
+    for client_id in range(num_clients):
+        per_client.append(run_client_baseline(dataset, client_id, num_clients, **kwargs))
+        # Give the finished client's VRAM back before the next builds its own
+        # 7B. Dropping the reference is not enough -- the caching allocator
+        # keeps the blocks reserved, so the two briefly coexist. That handover
+        # is where the grag sweep died with `CUDA driver error: out of memory`
+        # on this 16GB card.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     metric_keys = sorted({k for r in per_client for k, v in r.items() if isinstance(v, (int, float))})
     mean_metrics = {

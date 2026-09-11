@@ -33,7 +33,9 @@ from fedcond_grag.baselines.wandb_logging import log_baseline_result
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset", choices=list(DATASET_NAMES) + ["all"], default="all")
+    parser.add_argument("--dataset", choices=list(DATASET_NAMES) + [
+        "all", "hotpotqa__dirichlet_0.1", "musique__dirichlet_0.1", "2wikimultihop__dirichlet_0.1",
+    ], default="all")
     parser.add_argument("--num_clients", type=int, default=5)
     parser.add_argument("--client", type=int, default=None,
                          help="Run only this client id (0-indexed). Default: run all clients.")
@@ -43,6 +45,8 @@ def main() -> None:
     parser.add_argument("--embedding_batch_size", type=int, default=32)
     parser.add_argument("--no_cluster", action="store_true", help="Disable ComoRAG's semantic/episodic clustering")
     parser.add_argument("--save_root", default=str(DEFAULT_SAVE_ROOT))
+    parser.add_argument("--dump_predictions", default=None,
+                         help="Append per-question {id, client_id, pred, label} JSONL rows here.")
     args = parser.parse_args()
 
     datasets = list(DATASET_NAMES) if args.dataset == "all" else [args.dataset]
@@ -58,11 +62,13 @@ def main() -> None:
 
     for dataset in datasets:
         if args.client is not None:
-            result = run_client_baseline(dataset, args.client, args.num_clients, **common_kwargs)
+            result = run_client_baseline(dataset, args.client, args.num_clients,
+                                          dump_predictions_path=args.dump_predictions, **common_kwargs)
             print(json.dumps(result, indent=2))
             log_baseline_result("comorag", dataset, result)
         else:
-            summary = run_all_clients(dataset, args.num_clients, **common_kwargs)
+            summary = run_all_clients(dataset, args.num_clients,
+                                       dump_predictions_path=args.dump_predictions, **common_kwargs)
             print(f"\n=== {dataset}: mean over {args.num_clients} clients ===")
             print(json.dumps(summary["mean"], indent=2))
             log_baseline_result("comorag", dataset, summary)

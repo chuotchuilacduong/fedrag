@@ -30,7 +30,10 @@ from fedcond_grag.baselines.wandb_logging import log_baseline_result
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset", required=True, choices=["hotpotqa", "musique", "2wikimultihop"])
+    parser.add_argument("--dataset", required=True, choices=[
+        "hotpotqa", "musique", "2wikimultihop",
+        "hotpotqa__dirichlet_0.1", "musique__dirichlet_0.1", "2wikimultihop__dirichlet_0.1",
+    ])
     parser.add_argument("--num_clients", type=int, default=3)
     parser.add_argument("--client", type=int, default=None,
                          help="Run only this client id (0-indexed). Default: run all clients.")
@@ -39,6 +42,8 @@ def main() -> None:
     parser.add_argument("--retrieval_top_k", type=int, default=5)
     parser.add_argument("--max_eval_samples", type=int, default=200)
     parser.add_argument("--save_root", default=str(DEFAULT_SAVE_ROOT))
+    parser.add_argument("--dump_predictions", default=None,
+                         help="Append per-question {id, client_id, pred, label} JSONL rows here.")
     args = parser.parse_args()
 
     common_kwargs = dict(
@@ -47,6 +52,7 @@ def main() -> None:
         retrieval_top_k=args.retrieval_top_k,
         max_eval_samples=args.max_eval_samples,
         save_root=args.save_root,
+        dump_predictions_path=args.dump_predictions,
     )
 
     if args.client is not None:

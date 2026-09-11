@@ -35,7 +35,10 @@ from fedcond_grag.baselines.wandb_logging import log_baseline_result
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset", required=True, choices=["hotpotqa", "musique", "2wikimultihop"])
+    parser.add_argument("--dataset", required=True, choices=[
+        "hotpotqa", "musique", "2wikimultihop",
+        "hotpotqa__dirichlet_0.1", "musique__dirichlet_0.1", "2wikimultihop__dirichlet_0.1",
+    ])
     parser.add_argument("--num_clients", type=int, default=5)
     parser.add_argument("--client", type=int, default=None,
                          help="Run only this client id (0-indexed). Default: run all clients.")
@@ -46,7 +49,13 @@ def main() -> None:
     parser.add_argument("--retrieval_topk", type=int, default=2)
     parser.add_argument("--max_sentences", type=int, default=4)
     parser.add_argument("--max_eval_samples", type=int, default=200)
+    parser.add_argument("--qa_data_root", default="dataset/fedcond_qa",
+                         help="QA cache to read questions from. Use the per-dataset root "
+                              "(dataset/fedcond_qa_<dataset>); the shared dataset/fedcond_qa "
+                              "is overwritten by whichever preprocess ran last.")
     parser.add_argument("--save_root", default=str(DEFAULT_SAVE_ROOT))
+    parser.add_argument("--dump_predictions", default=None,
+                         help="Append per-question {id, client_id, pred, label} JSONL rows here.")
     args = parser.parse_args()
 
     common_kwargs = dict(
@@ -57,15 +66,18 @@ def main() -> None:
         retrieval_topk=args.retrieval_topk,
         max_sentences=args.max_sentences,
         max_eval_samples=args.max_eval_samples,
+        qa_data_root=args.qa_data_root,
         save_root=args.save_root,
     )
 
     if args.client is not None:
-        result = run_client_baseline(args.dataset, args.client, args.num_clients, **common_kwargs)
+        result = run_client_baseline(args.dataset, args.client, args.num_clients,
+                                      dump_predictions_path=args.dump_predictions, **common_kwargs)
         print(json.dumps(result, indent=2))
         log_baseline_result("flare", args.dataset, result)
     else:
-        summary = run_all_clients(args.dataset, args.num_clients, **common_kwargs)
+        summary = run_all_clients(args.dataset, args.num_clients,
+                                   dump_predictions_path=args.dump_predictions, **common_kwargs)
         print(f"\n=== {args.dataset}: mean over {args.num_clients} clients ===")
         print(json.dumps(summary["mean"], indent=2))
         log_baseline_result("flare", args.dataset, summary)

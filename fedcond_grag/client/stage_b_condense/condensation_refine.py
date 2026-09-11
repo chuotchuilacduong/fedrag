@@ -165,12 +165,23 @@ def refine_condensed_graph(
         assign = torch.softmax(h_v @ h_tilde.T / rep_scale, dim=-1)      # Π_m
         loss_rep = (assign @ h_tilde - h_v).pow(2).sum(dim=-1).mean()
 
-        # L_div — hinge on pairwise cosine similarity of condensed features
+        # L_div — hinge on pairwise cosine similarity of condensed features.
+        # Sum over OFF-diagonal entries only, but without ever materializing a
+        # k x k boolean mask or a masked-select copy: after F.normalize every
+        # diagonal entry of `gram` is exactly 1.0, so
+        #   sum_offdiag relu(gram - margin) = sum_all relu(gram - margin) - k * relu(1 - margin)
+        # At k=15035 (this project's largest condensed graph, entity_ratio=0.2)
+        # the mask + masked copy allocated ~1.1GB EVERY iteration on top of the
+        # 0.9GB gram matrix -- while the loaded 7B model + LoRA already leave
+        # under 400MB free on a 16GB card. That is not slow, it is allocator
+        # thrashing: measured stuck for 70+ minutes with zero progress and no
+        # error (PyTorch's caching allocator retrying, not failing loudly).
+        # r02/r05/r10 (k <= ~9660) never crossed the threshold where this bit.
         x_norm = F.normalize(x_tilde, dim=-1)
         gram = x_norm @ x_norm.T
         k = x_tilde.size(0)
-        off_diag = ~torch.eye(k, dtype=torch.bool, device=device)
-        loss_div = F.relu(gram[off_diag] - cfg.delta_margin).sum() / max(k * k, 1)
+        diag_term = k * F.relu(torch.tensor(1.0 - cfg.delta_margin, device=device))
+        loss_div = (F.relu(gram - cfg.delta_margin).sum() - diag_term) / max(k * k, 1)
 
         total = loss_ret + cfg.lambda_rep * loss_rep + cfg.lambda_div * loss_div
         optimizer.zero_grad()

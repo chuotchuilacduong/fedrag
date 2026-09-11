@@ -65,7 +65,23 @@ DEFAULT_ARGS: dict[str, Any] = dict(
     retrieval_topk=2,          # "
     max_sentences=4,           # answer length cap for short-answer QA (vs. FLARE's long-form default)
     max_eval_samples=200,
+    num_workers=8,             # questions answered concurrently; see run_client_baseline
+    # Which QA cache to read questions from. This used to be hardcoded to
+    # "dataset/fedcond_qa" regardless of --dataset, so a FLARE run retrieved
+    # from one dataset's corpus while being asked another dataset's questions
+    # (that shared root is rebuilt per dataset and stamped in _meta.json; the
+    # mismatch guard in main.py/trainer.py never runs for baselines, which
+    # construct FedCondQADataset directly). Pass the per-dataset root --
+    # dataset/fedcond_qa_<dataset> -- same as grag/gretriever already do.
+    qa_data_root="dataset/fedcond_qa",
 )
+
+
+# Questions are answered concurrently (see run_client_baseline), but one
+# SentenceTransformer is shared across those threads and concurrent .encode()
+# calls on the same module are not safe. Encoding is milliseconds next to a
+# generation call, so serialising just this leaves the LLM calls fully parallel.
+_ENC_LOCK = __import__("threading").Lock()
 
 
 class _CorpusRetriever:
@@ -85,9 +101,10 @@ class _CorpusRetriever:
         if not query.strip() or self.embeddings is None:
             return []
         import torch
-        q_emb = self.encoder.encode(
-            [query], convert_to_tensor=True, normalize_embeddings=True, show_progress_bar=False,
-        ).float().cpu()[0]
+        with _ENC_LOCK:
+            q_emb = self.encoder.encode(
+                [query], convert_to_tensor=True, normalize_embeddings=True, show_progress_bar=False,
+            ).float().cpu()[0]
         sims = self.embeddings @ q_emb
         k = min(topk, len(self.passages))
         top_idx = torch.topk(sims, k).indices.tolist()
@@ -95,6 +112,12 @@ class _CorpusRetriever:
 
 
 def _load_client_passages(dataset: str, client_id: int, num_clients: int) -> list[str]:
+    # A prebuilt partition (e.g. a Dirichlet client-skew variant) takes
+    # precedence over the legacy iid `index % num_clients` split below --
+    # see `main.py preprocess --partition-mode` / topic_partition.py.
+    partition_path = _ROOT / "processed" / dataset / f"client_{client_id}" / "chunks.json"
+    if partition_path.exists():
+        return json.loads(partition_path.read_text(encoding="utf-8"))
     hippo_name = DATASET_NAMES[dataset]
     corpus = json.loads((RAW_DIR / f"{hippo_name}_corpus.json").read_text(encoding="utf-8"))
     return [
@@ -172,15 +195,41 @@ def _flare_answer(client, model: str, retriever: _CorpusRetriever, question: str
     return answer.strip()
 
 
+def _open_qa_dataset(qa_data_root: str, dataset: str):
+    """Open a QA cache and refuse one that was built from a different
+    dataset. `dataset/fedcond_qa` is a shared scratch root that whichever
+    preprocess ran last overwrites, so silently reading it is how FLARE ended
+    up asking 2wikimultihop questions against a hotpotqa corpus."""
+    from fedcond_grag.dataloader import FedCondQADataset
+
+    root = Path(qa_data_root)
+    meta_path = root / "_meta.json"
+    if meta_path.exists():
+        built_from = json.loads(meta_path.read_text(encoding="utf-8")).get("dataset")
+        if built_from and built_from != dataset:
+            raise SystemExit(
+                f"QA cache {root} was built from {built_from!r} but this run is "
+                f"--dataset {dataset!r}. Pass --qa_data_root dataset/fedcond_qa_{dataset} "
+                f"(or rebuild: python scripts/build_fedcond_qa_dataset.py --dataset {dataset})."
+            )
+    return FedCondQADataset(root=str(root))
+
+
 def run_client_baseline(
     dataset: str,
     client_id: int,
     num_clients: int,
     save_root: Path | str = DEFAULT_SAVE_ROOT,
+    dump_predictions_path: str | None = None,
     **arg_overrides: Any,
 ) -> dict[str, Any]:
     """Answer the full global question set for `dataset` using FLARE,
-    retrieving only from client `client_id`'s own passage shard."""
+    retrieving only from client `client_id`'s own passage shard.
+
+    If `dump_predictions_path` is given, appends one JSONL row per question
+    ({"id", "client_id", "pred", "label"}) for every question in this run's
+    eval slice -- so F1 can be recomputed post-hoc split by subgroup (e.g.
+    local-vs-cross-client gold evidence)."""
     from openai import OpenAI
     from fedcond_grag.dataloader import FedCondQADataset
 
@@ -192,22 +241,42 @@ def run_client_baseline(
 
     client = OpenAI(base_url=args.llm_base_url, api_key="sk-")
 
-    qa_dataset = FedCondQADataset(root="dataset/fedcond_qa")
+    qa_dataset = _open_qa_dataset(args.qa_data_root, dataset)
     idx_split = qa_dataset.get_idx_split()
     max_eval = int(args.max_eval_samples)
     eval_idx = (idx_split["val"] + idx_split["test"])[:max_eval]
 
-    hits = em_total = f1_total = 0.0
-    for i in eval_idx:
+    # FLARE is by far the most expensive baseline here: every question costs up
+    # to max_sentences x 2 generation calls, and they used to run strictly one
+    # question after another. The steps *within* a question are inherently
+    # sequential (look-ahead -> retrieve -> regenerate), but questions are
+    # independent, so answering several at once lets the server merge them into
+    # one batched generate() instead of idling between single requests.
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _answer(i):
         row = qa_dataset[i]
         raw_question = row["question"].split("Question: ", 1)[-1].split("\nAnswer:")[0]
-        pred = _flare_answer(client, args.llm_name, retriever, raw_question, args)
-        label = row["label"]
+        return row["id"], _flare_answer(client, args.llm_name, retriever, raw_question, args), row["label"]
+
+    workers = max(1, int(getattr(args, "num_workers", 8)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        answered = list(pool.map(_answer, eval_idx))   # map preserves input order
+
+    hits = em_total = f1_total = 0.0
+    for qid, pred, label in answered:
         if normalize(label) in normalize(pred):
             hits += 1
         if exact_match(pred, label):
             em_total += 1.0
         f1_total += token_f1(pred, label)
+
+    if dump_predictions_path:
+        with open(dump_predictions_path, "a") as f:
+            for qid, pred, label in answered:
+                f.write(json.dumps({
+                    "id": qid, "client_id": client_id, "pred": pred, "label": label,
+                }) + "\n")
 
     n = max(len(eval_idx), 1)
     return {
@@ -222,11 +291,15 @@ def run_client_baseline(
     }
 
 
-def run_all_clients(dataset: str, num_clients: int, save_root: Path | str = DEFAULT_SAVE_ROOT, **kwargs: Any) -> dict[str, Any]:
+def run_all_clients(dataset: str, num_clients: int, save_root: Path | str = DEFAULT_SAVE_ROOT,
+                     dump_predictions_path: str | None = None, **kwargs: Any) -> dict[str, Any]:
     """Run every client's local FLARE baseline independently and write a
     summary JSON (per-client metrics + mean across clients)."""
+    if dump_predictions_path:
+        Path(dump_predictions_path).write_text("")   # reset on new run
     per_client = [
-        run_client_baseline(dataset, client_id, num_clients, save_root=save_root, **kwargs)
+        run_client_baseline(dataset, client_id, num_clients, save_root=save_root,
+                             dump_predictions_path=dump_predictions_path, **kwargs)
         for client_id in range(num_clients)
     ]
 

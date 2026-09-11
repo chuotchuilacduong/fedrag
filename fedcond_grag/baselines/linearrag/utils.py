@@ -16,7 +16,15 @@ def compute_mdhash_id(content: str, prefix: str = "") -> str:
 
 class LLM_Model:
     def __init__(self, llm_model):
-        http_client = httpx.Client(timeout=60.0, trust_env=False)
+        # qa() fans out over ThreadPoolExecutor(max_workers=16), which is fine
+        # against a server that batches (Ollama) but not against a single-GPU
+        # endpoint that serialises generation: the 16th queued request waits
+        # for the 15 ahead of it and blows a 60s deadline, and the client
+        # disconnect then surfaces server-side as a broken pipe. Queueing costs
+        # nothing here (the GPU is the bottleneck either way), so raise the
+        # deadline rather than cutting max_workers, which spacy NER also uses.
+        timeout = float(os.getenv("LINEARRAG_LLM_TIMEOUT", "60"))
+        http_client = httpx.Client(timeout=timeout, trust_env=False)
         self.openai_client = OpenAI(
             api_key=os.getenv("OPENAI_API_KEY"),
             base_url=os.getenv("OPENAI_BASE_URL"),

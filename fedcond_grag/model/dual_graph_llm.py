@@ -14,6 +14,16 @@ class DualGraphLLM(GraphLLM):
 
         self.dual_graph_mode = getattr(args, "dual_graph_mode", "shared")
 
+        # Soft-prompt width per graph slot. 1 == the original single mean-pooled
+        # token (bit-compatible with checkpoints trained before this change).
+        # The condensed slot is the ONLY channel carrying cross-client evidence
+        # -- desc is always local text -- so it is the one worth widening.
+        self.n_graph_tokens_e = max(1, int(getattr(args, "graph_tokens_evidence", 1) or 1))
+        self.n_graph_tokens_c = max(1, int(getattr(args, "graph_tokens_condensed", 1) or 1))
+        if self.n_graph_tokens_e > 1 or self.n_graph_tokens_c > 1:
+            print(f"Graph soft-prompt tokens: evidence={self.n_graph_tokens_e} "
+                  f"condensed={self.n_graph_tokens_c}", flush=True)
+
         if self.dual_graph_mode in ("shared", "no_synthetic"):
             # shared: one GNN encoder for both graphs.
             # no_synthetic: separate encoders exist but condensed slot always gets
@@ -57,7 +67,22 @@ class DualGraphLLM(GraphLLM):
             return graph.batch
         return torch.zeros(graph.x.size(0), dtype=torch.long, device=graph.x.device)
 
-    def _encode_one_graph(self, graph, encoder, projector):
+    def _encode_one_graph(self, graph, encoder, projector, n_tokens: int = 1, q=None):
+        """Encode one graph into `n_tokens` soft-prompt tokens -> [B, n_tokens, H].
+
+        Upstream (and this repo until now) mean-pooled the whole subgraph into a
+        SINGLE token per graph, so the condensed/synthetic slot carried all
+        cross-client knowledge in one averaged vector. On hotpotqa 73.4% of test
+        questions need evidence held by another client, and the reader's text
+        (`desc`) is 100% local -- the condensed graph ships embeddings only, no
+        node_text -- so that one vector was the entire cross-client channel.
+        A mean of hundreds of nodes cannot supply the specific tokens F1 scores.
+
+        Token 0 stays the mean-pool (identical to the old behaviour, so
+        n_tokens=1 is bit-compatible with existing checkpoints). Tokens 1..k-1
+        are the individual node embeddings most similar to the question, so the
+        extra capacity carries query-relevant detail rather than more averages.
+        """
         _param = next(encoder.parameters(), None)
         enc_device = _param.device if _param is not None else graph.x.device
         graph = graph.to(enc_device)
@@ -67,15 +92,39 @@ class DualGraphLLM(GraphLLM):
         if edge_attr is not None:
             edge_attr = edge_attr.to(dtype)
         n_embeds, _ = encoder(x, graph.edge_index.long(), edge_attr)
-        g_embeds = scatter(n_embeds, self._graph_batch(graph), dim=0, reduce="mean")
-        return projector(g_embeds)
+        batch_vec = self._graph_batch(graph)
+        pooled = scatter(n_embeds, batch_vec, dim=0, reduce="mean")     # [B, He]
+
+        if n_tokens <= 1:
+            return projector(pooled).unsqueeze(1)                       # [B, 1, H]
+
+        B = pooled.size(0)
+        toks = pooled.new_zeros(B, n_tokens, pooled.size(1))
+        toks[:, 0] = pooled
+        for b in range(B):
+            idx = (batch_vec == b).nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                toks[b, 1:] = pooled[b]
+                continue
+            if q is not None and q[b] is not None:
+                qb = q[b].to(device=enc_device, dtype=dtype).view(1, -1)
+                if qb.size(1) == x.size(1):
+                    sims = torch.nn.functional.cosine_similarity(qb, x[idx], dim=1)
+                    idx = idx[sims.argsort(descending=True)]
+            sel = idx[: n_tokens - 1]
+            toks[b, 1 : 1 + sel.numel()] = n_embeds[sel]
+            if sel.numel() < n_tokens - 1:      # small subgraph -> pad with the pool
+                toks[b, 1 + sel.numel() :] = pooled[b]
+        return projector(toks)                                          # [B, k, H]
 
     def encode_graphs(self, samples):
         evidence_graph = samples.get("graph", samples.get("evidence_graph"))
         if evidence_graph is None:
             raise KeyError("DualGraphLLM requires samples['graph'] or samples['evidence_graph']")
 
-        z_e = self._encode_one_graph(evidence_graph, self.graph_encoder, self.projector)
+        q = samples.get("q_emb")
+        k_e, k_c = self.n_graph_tokens_e, self.n_graph_tokens_c
+        z_e = self._encode_one_graph(evidence_graph, self.graph_encoder, self.projector, k_e, q)
 
         # Soft synthetic context override (FedRAG query-conditioned memory
         # adaptation): a precomputed [B, H] tensor takes the condensed slot so
@@ -83,24 +132,27 @@ class DualGraphLLM(GraphLLM):
         z_c_soft = samples.get("z_c_soft")
         if z_c_soft is not None:
             z_c = z_c_soft.to(device=z_e.device, dtype=z_e.dtype)
+            if z_c.dim() == 2:                       # [B, H] -> [B, k_c, H]
+                z_c = z_c.unsqueeze(1).expand(-1, k_c, -1)
             return self._apply_dual_graph_mode(z_e, z_c)
 
         condensed_graph = samples.get("condensed_graph")
         if self.dual_graph_mode == "no_synthetic":
             # No-synthetic ablation: ignore server graph entirely; both slots get
             # the evidence graph encoded by the same evidence encoder + projector.
-            z_c = self._encode_one_graph(evidence_graph, self.graph_encoder, self.projector)
+            z_c = self._encode_one_graph(evidence_graph, self.graph_encoder, self.projector, k_c, q)
         elif self.dual_graph_mode == "shared":
             # Shared-encoder ablation: encode condensed graph with same GNN + projector
             if condensed_graph is None:
-                z_c = z_e * 0.0
+                z_c = z_e.new_zeros(z_e.size(0), k_c, z_e.size(-1))
             else:
-                z_c = self._encode_one_graph(condensed_graph, self.graph_encoder, self.projector)
+                z_c = self._encode_one_graph(condensed_graph, self.graph_encoder, self.projector, k_c, q)
         else:
             if condensed_graph is None:
-                z_c = torch.zeros_like(z_e)
+                z_c = z_e.new_zeros(z_e.size(0), k_c, z_e.size(-1))
             else:
-                z_c = self._encode_one_graph(condensed_graph, self.condensed_encoder, self.projector_c)
+                z_c = self._encode_one_graph(
+                    condensed_graph, self.condensed_encoder, self.projector_c, k_c, q)
 
         return self._apply_dual_graph_mode(z_e, z_c)
 
@@ -167,7 +219,7 @@ class DualGraphLLM(GraphLLM):
             text_len = len(all_text_ids[i])
             label_len = len(all_label_ids[i])
             text_embeds = all_text_embeds[i, :text_len]                # [T_i, H]
-            graph_tokens = torch.stack([z_e[i], z_c[i]], dim=0)        # [2, H]
+            graph_tokens = torch.cat([z_e[i], z_c[i]], dim=0)          # [k_e + k_c, H]
             inputs_embeds = torch.cat([bos_embeds, graph_tokens, text_embeds], dim=0)
             seq_len = inputs_embeds.shape[0]
             batch_inputs_embeds.append(inputs_embeds)
@@ -236,7 +288,7 @@ class DualGraphLLM(GraphLLM):
         seq_lens: list[int] = []
         for i in range(batch_size):
             text_embeds = all_text_embeds[i, : len(all_text_ids[i])]
-            graph_tokens = torch.stack([z_e[i], z_c[i]], dim=0)
+            graph_tokens = torch.cat([z_e[i], z_c[i]], dim=0)
             inputs_embeds = torch.cat([bos_embeds, graph_tokens, text_embeds], dim=0)
             batch_inputs_embeds.append(inputs_embeds)
             seq_lens.append(inputs_embeds.shape[0])

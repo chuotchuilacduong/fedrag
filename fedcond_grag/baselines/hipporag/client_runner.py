@@ -88,7 +88,21 @@ HIPPO_DATASET_NAMES = {
 }
 
 
-def _load_client_docs(hippo_name: str, client_id: int, num_clients: int) -> list[str]:
+def _base_dataset_name(dataset: str) -> str:
+    """Strip a partition-variant suffix (e.g. 'hotpotqa__dirichlet_0.1' ->
+    'hotpotqa') so raw-corpus/question lookups keyed by HIPPO_DATASET_NAMES
+    still resolve -- the questions/gold answers are the same regardless of
+    which client-corpus partition is in use."""
+    return dataset.split("__", 1)[0]
+
+
+def _load_client_docs(dataset: str, hippo_name: str, client_id: int, num_clients: int) -> list[str]:
+    # A prebuilt partition (e.g. a Dirichlet client-skew variant) takes
+    # precedence over the legacy iid `index % num_clients` split below --
+    # see `main.py preprocess --partition-mode` / topic_partition.py.
+    partition_path = _ROOT / "processed" / dataset / f"client_{client_id}" / "chunks.json"
+    if partition_path.exists():
+        return json.loads(partition_path.read_text(encoding="utf-8"))
     corpus = json.loads((RAW_DIR / f"{hippo_name}_corpus.json").read_text(encoding="utf-8"))
     return [
         f"{item['title']}\n{item['text']}"
@@ -141,12 +155,26 @@ def run_client_baseline(
     save_root: Path | str = DEFAULT_SAVE_ROOT,
     force_index_from_scratch: bool = False,
     force_openie_from_scratch: bool = False,
+    max_eval_samples: int = 0,
+    dump_predictions_path: str | None = None,
 ) -> dict[str, Any]:
     """Index client `client_id`'s local shard with HippoRAG and evaluate it
-    against the full global question set for `dataset`."""
-    hippo_name = HIPPO_DATASET_NAMES[dataset]
-    docs = _load_client_docs(hippo_name, client_id, num_clients)
+    against the full global question set for `dataset`.
+
+    If `dump_predictions_path` is given, appends one JSONL row per question
+    ({"id", "client_id", "pred", "label"}) -- so F1 can be recomputed
+    post-hoc split by subgroup (e.g. local-vs-cross-client gold evidence)."""
+    hippo_name = HIPPO_DATASET_NAMES[_base_dataset_name(dataset)]
+    docs = _load_client_docs(dataset, hippo_name, client_id, num_clients)
     samples = _load_global_samples(hippo_name)
+    # Every other baseline caps evaluation at max_eval_samples (200 by
+    # default), so leaving this uncapped made HippoRAG the only method scored
+    # on all 1000 questions -- same question pool and same order, but a
+    # different sample size, which is not comparable in a shared table.
+    # Truncate here, before queries/gold_answers/gold_docs are derived, so all
+    # three stay aligned. 0 keeps the full set.
+    if max_eval_samples:
+        samples = samples[: int(max_eval_samples)]
     queries = [s["question"] for s in samples]
     gold_answers = _load_gold_answers(samples)
     gold_docs = _load_gold_docs(samples, hippo_name)
@@ -165,9 +193,19 @@ def run_client_baseline(
 
     rag = HippoRAG(global_config=config)
     rag.index(docs)
-    _, _, _, overall_retrieval_result, overall_qa_results = rag.rag_qa(
+    queries_solutions, _, _, overall_retrieval_result, overall_qa_results = rag.rag_qa(
         queries=queries, gold_docs=gold_docs, gold_answers=gold_answers
     )
+
+    if dump_predictions_path:
+        with open(dump_predictions_path, "a") as f:
+            for sample, solution in zip(samples, queries_solutions):
+                gold_answer = sample.get("answer", sample.get("gold_ans"))
+                label = gold_answer if isinstance(gold_answer, str) else "|".join(gold_answer)
+                f.write(json.dumps({
+                    "id": str(sample.get("_id", sample.get("id"))), "client_id": client_id,
+                    "pred": solution.answer, "label": label,
+                }) + "\n")
 
     return {
         "dataset": dataset,
@@ -180,12 +218,16 @@ def run_client_baseline(
     }
 
 
-def run_all_clients(dataset: str, num_clients: int, save_root: Path | str = DEFAULT_SAVE_ROOT, **kwargs) -> dict[str, Any]:
+def run_all_clients(dataset: str, num_clients: int, save_root: Path | str = DEFAULT_SAVE_ROOT,
+                     dump_predictions_path: str | None = None, **kwargs) -> dict[str, Any]:
     """Run every client's local HippoRAG baseline and write a summary JSON
     (per-client metrics + mean across clients) next to the per-client
     HippoRAG save dirs."""
+    if dump_predictions_path:
+        Path(dump_predictions_path).write_text("")   # reset on new run
     per_client = [
-        run_client_baseline(dataset, client_id, num_clients, save_root=save_root, **kwargs)
+        run_client_baseline(dataset, client_id, num_clients, save_root=save_root,
+                             dump_predictions_path=dump_predictions_path, **kwargs)
         for client_id in range(num_clients)
     ]
 
