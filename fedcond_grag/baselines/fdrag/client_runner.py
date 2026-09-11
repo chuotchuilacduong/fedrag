@@ -40,9 +40,37 @@ DATASET_NAMES = {
 }
 
 
-def _load_client_corpus(hippo_name: str, client_id: int, num_clients: int, max_docs: Optional[int] = None) -> list[dict]:
-    corpus = json.loads((RAW_DIR / f"{hippo_name}_corpus.json").read_text(encoding="utf-8"))
-    shard = [item for i, item in enumerate(corpus) if i % num_clients == client_id]
+def _base_dataset_name(dataset: str) -> str:
+    """Strip a partition-variant suffix (e.g. 'hotpotqa__dirichlet_0.1' ->
+    'hotpotqa') so raw-corpus/question lookups keyed by DATASET_NAMES still
+    resolve -- the questions/gold answers are the same regardless of which
+    client-corpus partition is in use."""
+    return dataset.split("__", 1)[0]
+
+
+def _parse_chunk_body(body: str) -> dict:
+    """`processed/<ds>/client_X/chunks.json` entries are "{title}: {text}"
+    strings (see scripts/setup_datasets.py's _build_chunks and
+    fedcond_grag/dataloader/topic_partition.py's _chunk_title_and_text) --
+    recover a {title, text} dict since FDRAG.index() expects the same shape
+    as the raw *_corpus.json."""
+    title, sep, text = body.partition(": ")
+    if not sep:
+        return {"title": body.strip(), "text": ""}
+    return {"title": title.strip(), "text": text.strip()}
+
+
+def _load_client_corpus(dataset: str, hippo_name: str, client_id: int, num_clients: int, max_docs: Optional[int] = None) -> list[dict]:
+    # A prebuilt partition (e.g. a Dirichlet client-skew variant) takes
+    # precedence over the legacy iid `index % num_clients` split below --
+    # see `main.py preprocess --partition-mode` / topic_partition.py.
+    partition_path = _ROOT / "processed" / dataset / f"client_{client_id}" / "chunks.json"
+    if partition_path.exists():
+        bodies = json.loads(partition_path.read_text(encoding="utf-8"))
+        shard = [_parse_chunk_body(b) for b in bodies]
+    else:
+        corpus = json.loads((RAW_DIR / f"{hippo_name}_corpus.json").read_text(encoding="utf-8"))
+        shard = [item for i, item in enumerate(corpus) if i % num_clients == client_id]
     if max_docs is not None:
         shard = shard[:max_docs]
     return shard
@@ -100,9 +128,10 @@ def run_client_baseline(
     use_llm: bool = True,
     save_root: Path | str = DEFAULT_SAVE_ROOT,
     cfg_overrides: Optional[dict[str, Any]] = None,
+    dump_predictions_path: str | None = None,
 ) -> dict[str, Any]:
-    hippo_name = DATASET_NAMES[dataset]
-    corpus = _load_client_corpus(hippo_name, client_id, num_clients, max_docs=max_docs_per_client)
+    hippo_name = DATASET_NAMES[_base_dataset_name(dataset)]
+    corpus = _load_client_corpus(dataset, hippo_name, client_id, num_clients, max_docs=max_docs_per_client)
     samples = _load_global_samples(hippo_name)
     if max_eval_samples:
         samples = samples[:max_eval_samples]
@@ -125,16 +154,26 @@ def run_client_baseline(
     hits = em_total = f1_total = 0.0
     fast_ct = slow_ct = llm_calls = 0
     total_latency = 0.0
-    for sample, answers in zip(samples, gold):
-        r = rag.answer(sample["question"])
-        h, e, f = _score(r.answer, answers)
-        hits += h; em_total += e; f1_total += f
-        llm_calls += r.llm_calls
-        total_latency += r.latency_sec
-        if r.path == "fast":
-            fast_ct += 1
-        elif r.path.startswith("slow"):
-            slow_ct += 1
+    dump_f = open(dump_predictions_path, "a") if dump_predictions_path else None
+    try:
+        for sample, answers in zip(samples, gold):
+            r = rag.answer(sample["question"])
+            h, e, f = _score(r.answer, answers)
+            hits += h; em_total += e; f1_total += f
+            llm_calls += r.llm_calls
+            total_latency += r.latency_sec
+            if r.path == "fast":
+                fast_ct += 1
+            elif r.path.startswith("slow"):
+                slow_ct += 1
+            if dump_f is not None:
+                dump_f.write(json.dumps({
+                    "id": str(sample.get("_id", sample.get("id"))), "client_id": client_id,
+                    "pred": r.answer, "label": "|".join(answers),
+                }) + "\n")
+    finally:
+        if dump_f is not None:
+            dump_f.close()
 
     n = max(len(samples), 1)
     result = {
@@ -178,8 +217,12 @@ def run_all_clients(
     opt_steps: int = 300,
     use_llm: bool = True,
     cfg_overrides: Optional[dict[str, Any]] = None,
+    dump_predictions_path: str | None = None,
 ) -> dict[str, Any]:
-    hippo_name = DATASET_NAMES[dataset]
+    if dump_predictions_path:
+        Path(dump_predictions_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(dump_predictions_path).write_text("")   # reset on new run
+    hippo_name = DATASET_NAMES[_base_dataset_name(dataset)]
     samples = _load_global_samples(hippo_name)
     if max_eval_samples:
         samples = samples[:max_eval_samples]
@@ -200,7 +243,7 @@ def run_all_clients(
         if cfg_overrides:
             for k, v in cfg_overrides.items():
                 setattr(cfg, k, v)
-        corpus = _load_client_corpus(hippo_name, cid, num_clients, max_docs=max_docs_per_client)
+        corpus = _load_client_corpus(dataset, hippo_name, cid, num_clients, max_docs=max_docs_per_client)
         rag = FDRAG(cfg, encoder=encoder, llm_infer=llm_infer, client_id=cid)
         stats = rag.index(corpus)
         clients.append(rag)
@@ -225,14 +268,24 @@ def run_all_clients(
         fast_ct = 0
         llm_calls = 0
         total_latency = 0.0
-        for sample, answers in zip(samples, gold):
-            r = rag.answer(sample["question"])
-            h, e, f = _score(r.answer, answers)
-            hits += h; em_total += e; f1_total += f
-            llm_calls += r.llm_calls
-            total_latency += r.latency_sec
-            if r.path == "fast":
-                fast_ct += 1
+        dump_f = open(dump_predictions_path, "a") if dump_predictions_path else None
+        try:
+            for sample, answers in zip(samples, gold):
+                r = rag.answer(sample["question"])
+                h, e, f = _score(r.answer, answers)
+                hits += h; em_total += e; f1_total += f
+                llm_calls += r.llm_calls
+                total_latency += r.latency_sec
+                if r.path == "fast":
+                    fast_ct += 1
+                if dump_f is not None:
+                    dump_f.write(json.dumps({
+                        "id": str(sample.get("_id", sample.get("id"))), "client_id": cid,
+                        "pred": r.answer, "label": "|".join(answers),
+                    }) + "\n")
+        finally:
+            if dump_f is not None:
+                dump_f.close()
         n = max(len(samples), 1)
         per_client.append({
             "dataset": dataset,

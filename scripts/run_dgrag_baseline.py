@@ -46,7 +46,12 @@ from fedcond_grag.baselines.wandb_logging import log_baseline_result
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset", required=True, choices=["hotpotqa", "musique", "2wikimultihop"])
+    parser.add_argument("--dataset", required=True, choices=[
+        "hotpotqa", "musique", "2wikimultihop",
+        "hotpotqa__dirichlet_0.1", "musique__dirichlet_0.1", "2wikimultihop__dirichlet_0.1",
+        "hotpotqa__dirichlet_1.0", "musique__dirichlet_1.0", "2wikimultihop__dirichlet_1.0",
+        "hotpotqa__random", "musique__random", "2wikimultihop__random",
+    ])
     parser.add_argument("--num_clients", type=int, default=4)
     parser.add_argument("--client", type=int, default=None,
                         help="Run only this client id (0-indexed). Default: run all clients.")
@@ -69,6 +74,8 @@ def main() -> None:
     parser.add_argument("--save_root", default=str(DEFAULT_SAVE_ROOT))
     parser.add_argument("--override", action="append", default=[],
                         help="Config override KEY=VALUE (repeatable). E.g. --override thr_summary=0.3")
+    parser.add_argument("--dump_predictions", default=None,
+                        help="Append per-question {id, client_id, pred, label} JSONL rows here.")
     args = parser.parse_args()
 
     cfg_overrides: dict = {}
@@ -93,6 +100,7 @@ def main() -> None:
         use_llm=not args.no_llm,
         save_root=args.save_root,
         cfg_overrides=cfg_overrides,
+        dump_predictions_path=args.dump_predictions,
     )
     if args.embedding_model:
         common["embedding_model_name"] = args.embedding_model
